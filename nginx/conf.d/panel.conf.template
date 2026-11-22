@@ -1,0 +1,69 @@
+# =========================================================
+# 用户控制台 / 管理面板域名配置（可开启 Cloudflare Proxy WAF 防护）
+# 使用方式：复制为 panel.conf，将 panel.yourdomain.com 替换为你的实际域名
+# 部署路径：/etc/nginx/conf.d/panel.conf
+# =========================================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name panel.yourdomain.com;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name panel.yourdomain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/panel.yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/panel.yourdomain.com/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:20m;
+    ssl_session_timeout 1d;
+
+    client_max_body_size 20m;
+
+    # 基础安全响应头
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    access_log /var/log/nginx/panel_access.log gateway_json;
+    error_log  /var/log/nginx/panel_error.log warn;
+
+    # 登录、注册、兑换码接口加强防爆破限流
+    location ~ ^/api/user/(login|register|topup|verification) {
+        limit_req zone=panel_rate burst=10 nodelay;
+        proxy_pass http://new_api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        proxy_pass http://new_api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 面板内也可能有在线测试对话（Playground），关闭缓冲确保流式体验
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+    }
+}

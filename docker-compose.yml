@@ -1,0 +1,149 @@
+# =========================================================
+# AI API 中转站生产级编排（云无关 / 适配 OVH 等各类赠金机）
+# 架构：Nginx(宿主机反代) -> New API + MySQL 8 + Redis 7 + Uptime Kuma
+# 安全红线：所有应用与数据库端口均不暴露至 0.0.0.0 公网
+# =========================================================
+
+services:
+  new-api:
+    image: calciumion/new-api:latest
+    container_name: new-api
+    restart: unless-stopped
+    command: --log-dir /app/logs
+    ports:
+      # 仅监听宿主机本地回环，由宿主机 Nginx 统一反代并做 TLS + 限流
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data/new-api:/data
+      - ./logs/new-api:/app/logs
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - SQL_DSN=${MYSQL_USER}:${MYSQL_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE}?charset=utf8mb4&parseTime=True&loc=Local
+      - REDIS_CONN_STRING=redis://:${REDIS_PASSWORD}@redis:6379
+      - SESSION_SECRET=${SESSION_SECRET}
+      - CRYPTO_SECRET=${CRYPTO_SECRET}
+      - BATCH_UPDATE_ENABLED=${BATCH_UPDATE_ENABLED:-true}
+      - BATCH_UPDATE_INTERVAL=${BATCH_UPDATE_INTERVAL:-5}
+      - ERROR_LOG_ENABLED=${ERROR_LOG_ENABLED:-true}
+      - MEMORY_CACHE_ENABLED=${MEMORY_CACHE_ENABLED:-true}
+      - NODE_TYPE=${NODE_TYPE:-master}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  mysql:
+    image: mysql:8.0
+    container_name: new-api-mysql
+    restart: unless-stopped
+    # 不向宿主机映射任何端口，仅 Docker 内部网络可见
+    volumes:
+      - ./mysql/my.cnf:/etc/mysql/conf.d/custom.cnf:ro
+      - ./mysql/data:/var/lib/mysql
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "30m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: new-api-redis
+    restart: unless-stopped
+    # 开启密码校验、限制最大内存防止撑爆赠金小鸡，并启用 AOF 轻持久化
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    volumes:
+      - ./redis/data:/data
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    restart: unless-stopped
+    ports:
+      # 对外展示公开状态页 (status.yourdomain.com)，仅绑回环由 Nginx 反代
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - ./uptime-kuma/data:/app/data
+    networks:
+      - gateway-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  quickwork2api:
+    image: alpine:3.20
+    container_name: quickwork2api
+    restart: unless-stopped
+    working_dir: /app
+    command: ["/bin/sh", "-c", "apk add --no-cache ca-certificates tzdata >/dev/null 2>&1 || true; exec /app/bin/quickproxy server -config /app/config.json"]
+    ports:
+      # 仅监听宿主机回环供本机调试，New API 通过 Docker 内网 http://quickwork2api:8080 直接调用
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ./aws-quickwork-2api:/app
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  gateway-net:
+    driver: bridge

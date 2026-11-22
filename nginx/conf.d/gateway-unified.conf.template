@@ -1,0 +1,108 @@
+# =========================================================
+# 统一中转站单域名配置模板：model.yourdomain.com（同时承载控制台面板 + /v1/* SSE 流式 API）
+# 使用方式：
+#   DOMAIN="model.yourdomain.com"
+#   sed "s/model.yourdomain.com/${DOMAIN}/g" nginx/conf.d/gateway-unified.conf.template | sudo tee "/etc/nginx/conf.d/${DOMAIN}.conf" >/dev/null
+# =========================================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name model.yourdomain.com;
+
+    # Certbot 自动续签验证路径（配合 webroot 模式免停机续签）
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name model.yourdomain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/model.yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/model.yourdomain.com/privkey.pem;
+
+    # 现代 TLS 安全基线（优先 TLS 1.3 降低跨境弱网握手耗时）
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:20m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # 允许大报文请求体（多模态图片 / 长上下文 / PDF Base64）
+    client_max_body_size 50m;
+    client_body_buffer_size 1m;
+
+    # 基础安全响应头
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    access_log /var/log/nginx/model_access.log gateway_json;
+    error_log  /var/log/nginx/model_error.log warn;
+
+    # 登录、注册、兑换码接口加强防爆破限流
+    location ~ ^/api/user/(login|register|topup|verification) {
+        limit_req zone=panel_rate burst=10 nodelay;
+
+        proxy_pass http://new_api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 大模型 API 推理端点（OpenAI / Anthropic / Gemini / Responses 等）
+    location ~ ^/(v1|v1beta|pg|mj|suno|kling|v2)/ {
+        limit_req zone=api_rate burst=40 nodelay;
+        limit_conn api_conn 50;
+
+        proxy_pass http://new_api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # ===== 核心：SSE 流式传输（打字机效果）必配项 =====
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+        gzip off;
+
+        # 延长超时，兜底慢速推理与深度思考模型（Thinking / Reasoning）
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+    }
+
+    # 控制台前端、Playground 与其余路由
+    location / {
+        proxy_pass http://new_api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+}
