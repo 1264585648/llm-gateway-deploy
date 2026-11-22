@@ -88,6 +88,16 @@ server {
         proxy_read_timeout 600s;
     }
 
+    # AWS Quick 批量上号器 & 号池管理面板（反代至 quickwork2api 本地回环端口）
+    location ^~ /quick-admin {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     # 控制台前端、Playground 与其余路由
     location / {
         proxy_pass http://new_api_backend;

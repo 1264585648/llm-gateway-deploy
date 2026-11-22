@@ -16,9 +16,11 @@ uptime-kuma/data/
 nginx/conf.d/*.conf
 !nginx/conf.d/00-gateway-common.conf
 
-# 第三方克隆仓库与构建产物
+# 第三方克隆仓库与构建产物（保留定制化 aws-quickwork-2api 源码，仅忽略其敏感配置、二进制与账号库）
 cloudpods-ocboot/
-aws-quickwork-2api/
+aws-quickwork-2api/bin/
+aws-quickwork-2api/data/
+aws-quickwork-2api/config.json
 
 # 系统临时文件
 .DS_Store

@@ -127,7 +127,36 @@ sudo nginx -t && sudo systemctl start nginx
 
 ---
 
-## 四、 赠金到期 / 封号：10 分钟平滑迁移 SOP
+## 四、 AWS Quick 多号池接入与 Web 批量上号器（定制版 `quickwork2api`）
+
+本仓库已内置深度定制的 **`aws-quickwork-2api`** 服务（位于 `aws-quickwork-2api/`，在 `docker-compose.yml` 中作为 `quickwork2api` 容器运行），无需安装官方桌面客户端即可将一批普通 Google 账号转化为高可用 **Claude Opus 5.5 (`us.anthropic.claude-opus-5-5`)** 上游号池。
+
+### 1. 针对中转站高并发与高缓存命中的深度定制特性
+- **用户/IP/会话粘性亲和（Sticky Affinity）**：按 `req.User` → `X-Conversation-Id` / `X-Thread-Id` → 客户端真实 IP（`Cf-Connecting-Ip` / `X-Real-Ip` / `X-Forwarded-For`）→ 会话指纹进行 FNV-1a 一致性哈希，保证同一用户或同一多轮会话固定路由至同一 Google 账号，最大化 `cache_read` 缓存命中率（高达 98%）。
+- **单号在途并发水位保护（Least-In-Flight Spillover）**：实时追踪每个 Google 账号的在途并发数（`inFlight`）。当某用户的粘性首选账号正在处理请求（`inFlight > 0`）时，新并发请求**自动溢出分配给当前 `inFlight == 0` 的空闲账号**，彻底杜绝并发请求堆死在单个账号上。
+- **内置 Web 批量上号器与号池监控面板（`/quick-admin`）**：
+  - 访问地址：`https://<你的域名>/quick-admin?key=<config.json中的api_key>`
+  - 支持一次批量生成 1~10 个独立 Google OAuth 登录槽位，粘贴两步回调 URL 即可秒级入库并自动加入轮询池。
+  - 实时大盘监控每个账号的 `In-Flight` 并发数、累计调用次数、Token 过期时间，并支持一键刷新 Token、启停或剔除账号。
+- **对外标准化模型 ID 映射**：
+  - `aws-quick-opus5-5` → 映射 `smart`（底层 `us.anthropic.claude-opus-5-5`，1M 上下文）
+  - `aws-quick-sonnet5-5` → 映射 `balanced`
+  - `aws-quick-haiku5-5` → 映射 `fast`
+  - 同时保留 `aws-quick-smart` / `aws-quick-fast` / `aws-quick-balanced` / `aws-quick-auto`
+
+### 2. 首次在新机器编译与启动 `quickwork2api`
+```bash
+cd /opt/llm-gateway/aws-quickwork-2api
+cp config.json.example config.json
+# 使用 Go 1.26 容器一键编译静态二进制
+docker run --rm -u $(id -u):$(id -g) -e CGO_ENABLED=0 -v "$PWD":/src -w /src golang:1.26-alpine go build -o bin/quickproxy ./cmd/quickproxy
+cd /opt/llm-gateway
+docker compose up -d quickwork2api
+```
+
+---
+
+## 五、 赠金到期 / 封号：10 分钟平滑迁移 SOP
 
 当 OVH 赠金快用完、准备切到下一家（GCP / Azure / AWS / DigitalOcean / 付费 VPS）时：
 
