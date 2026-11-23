@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import os
 import random
 import string
 import time
@@ -21,6 +22,23 @@ app.add_middleware(
 
 QUICKWORK_API = "http://quickwork2api:8080"
 
+FIRST_NAMES = ["Alex", "David", "Emma", "Sophia", "Daniel", "Olivia", "Michael", "Grace", "Lucas", "Chloe", "Ethan", "Hannah"]
+LAST_NAMES = ["Miller", "Taylor", "Brooks", "Wilson", "Clark", "Lewis", "Walker", "Hall", "Young", "Allen", "King", "Wright"]
+
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+delete Object.getPrototypeOf(navigator).webdriver;
+window.chrome = window.chrome || { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+Object.defineProperty(navigator, 'deviceMemory', { get: () => 16 });
+"""
+
+
+def random_name() -> str:
+    return f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
+
 
 def random_password() -> str:
     chars = string.ascii_letters + string.digits
@@ -29,14 +47,15 @@ def random_password() -> str:
 
 
 class JobState:
-    def __init__(self, job_id: str, email: str, name: str, password: str, admin_key: str):
+    def __init__(self, job_id: str, email: str, name: str, password: str, admin_key: str, proxy: str = ""):
         self.job_id = job_id
         self.email = email
         self.name = name
         self.password = password
         self.admin_key = admin_key
-        self.status = "starting"  # starting | sending_code | waiting_code | verifying | authorizing | done | error
-        self.message = "正在启动无头浏览器并初始化 AWS Quick 登录会话..."
+        self.proxy = proxy
+        self.status = "starting"
+        self.message = "正在启动真指纹浏览器并初始化 AWS Quick 登录会话..."
         self.error = ""
         self.session_id = ""
         self.discovery_url = ""
@@ -47,6 +66,7 @@ class JobState:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.captured_callback: Optional[str] = None
+        self.last_api_error: str = ""
         self.lock = asyncio.Lock()
 
 
@@ -59,12 +79,15 @@ async def get_browser() -> Browser:
     global playwright_instance, browser_instance
     if browser_instance is None or not browser_instance.is_connected():
         playwright_instance = await async_playwright().start()
+        use_headed = bool(os.environ.get("DISPLAY"))
         browser_instance = await playwright_instance.chromium.launch(
-            headless=True,
+            headless=not use_headed,
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--window-size=1280,800",
             ],
         )
     return browser_instance
@@ -104,14 +127,14 @@ async def detect_block_or_error(page: Page) -> Optional[str]:
     except Exception:
         return None
     if "captcha" in body or "puzzle" in body or "verify you are human" in body or "human verification" in body:
-        return "AWS 页面触发了人机验证/CAPTCHA，为遵守安全策略已停止自动化流程，请改用浏览器手动上号通道或更换节点/稍后再试。"
+        return "AWS 页面触发了人机验证/CAPTCHA，为遵守安全策略已停止自动化流程，请改用浏览器手动上号或切换代理/稍后再试。"
     for sel in ['[role="alert"]', '.awsui-alert-error', '[data-testid*="error"]']:
         try:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=300):
                 txt = (await loc.inner_text()).strip()
                 if txt and len(txt) > 3 and "required" not in txt.lower():
-                    return f"AWS 页面提示错误: {txt[:160]}"
+                    return f"AWS 页面提示错误: {txt[:180]}"
         except Exception:
             continue
     return None
@@ -121,6 +144,7 @@ class StartRequest(BaseModel):
     email: str
     name: Optional[str] = ""
     password: Optional[str] = ""
+    proxy: Optional[str] = ""
     admin_key: str
 
 
@@ -132,7 +156,12 @@ class VerifyRequest(BaseModel):
 
 @app.get("/quick-autoreg/healthz")
 async def healthz():
-    return {"status": "ok", "service": "quick-autoreg", "active_jobs": len(jobs)}
+    return {
+        "status": "ok",
+        "service": "quick-autoreg",
+        "display": os.environ.get("DISPLAY", ""),
+        "active_jobs": len(jobs),
+    }
 
 
 @app.post("/quick-autoreg/start")
@@ -158,10 +187,11 @@ async def start_register(req: StartRequest):
         raise HTTPException(status_code=500, detail=f"连接 quickwork2api 失败: {e}")
 
     job_id = uuid.uuid4().hex[:12]
-    name = (req.name or "").strip() or f"QuickUser{random.randint(100, 999)}"
+    name = (req.name or "").strip() or random_name()
     password = (req.password or "").strip() or random_password()
+    proxy = (req.proxy or "").strip()
 
-    job = JobState(job_id, email, name, password, req.admin_key)
+    job = JobState(job_id, email, name, password, req.admin_key, proxy=proxy)
     job.session_id = sess_data["id"]
     job.discovery_url = sess_data["discovery_url"]
     jobs[job_id] = job
@@ -177,11 +207,19 @@ async def start_register(req: StartRequest):
     }
 
 
-async def click_any(page: Page, selectors, timeout=5000) -> bool:
+async def human_click(page: Page, selectors, timeout=5000) -> bool:
     for sel in selectors:
         try:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=timeout):
+                box = await loc.bounding_box()
+                if box:
+                    await page.mouse.move(
+                        box["x"] + box["width"] * random.uniform(0.3, 0.7),
+                        box["y"] + box["height"] * random.uniform(0.3, 0.7),
+                        steps=random.randint(6, 14),
+                    )
+                    await asyncio.sleep(random.uniform(0.1, 0.3))
                 await loc.click()
                 return True
         except Exception:
@@ -189,13 +227,22 @@ async def click_any(page: Page, selectors, timeout=5000) -> bool:
     return False
 
 
-async def fill_any(page: Page, selectors, text: str, timeout=8000) -> bool:
+async def human_type_any(page: Page, selectors, text: str, timeout=8000) -> bool:
     for sel in selectors:
         try:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=timeout):
+                box = await loc.bounding_box()
+                if box:
+                    await page.mouse.move(
+                        box["x"] + box["width"] * random.uniform(0.3, 0.7),
+                        box["y"] + box["height"] * random.uniform(0.3, 0.7),
+                        steps=random.randint(5, 12),
+                    )
                 await loc.click()
-                await loc.fill(text)
+                await asyncio.sleep(random.uniform(0.15, 0.35))
+                await loc.fill("")
+                await loc.press_sequentially(text, delay=random.randint(45, 95))
                 return True
         except Exception:
             continue
@@ -206,12 +253,17 @@ async def drive_step1_send_code(job: JobState):
     async with job.lock:
         try:
             browser = await get_browser()
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                locale="en-US",
-                timezone_id="America/Los_Angeles",
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            )
+            ctx_kwargs = {
+                "viewport": {"width": 1280, "height": 800},
+                "locale": "en-US",
+                "timezone_id": "America/Los_Angeles",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            }
+            if job.proxy:
+                ctx_kwargs["proxy"] = {"server": job.proxy}
+
+            context = await browser.new_context(**ctx_kwargs)
+            await context.add_init_script(STEALTH_JS)
             page = await context.new_page()
             job.context = context
             job.page = page
@@ -223,6 +275,16 @@ async def drive_step1_send_code(job: JobState):
             await page.route("http://localhost:18080/**", intercept_callback)
             await page.route("http://127.0.0.1:18080/**", intercept_callback)
 
+            async def log_sso_resp(resp):
+                if "sso.signin.aws" in resp.url and resp.status >= 400:
+                    try:
+                        txt = await resp.text()
+                        print(f"[autoreg {job.job_id}] {resp.status} {resp.url} -> {txt[:300]}", flush=True)
+                    except Exception:
+                        pass
+
+            page.on("response", log_sso_resp)
+
             job.status = "sending_code"
             job.message = f"正在打开 AWS Quick 登录页并填入邮箱 {job.email}..."
             await page.goto(job.discovery_url, wait_until="domcontentloaded", timeout=35000)
@@ -232,9 +294,10 @@ async def drive_step1_send_code(job: JobState):
             except Exception:
                 pass
 
-            await click_any(page, ["button#awsccc-cb-btn-accept", "button:has-text('Accept')"], timeout=1200)
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+            await human_click(page, ["button#awsccc-cb-btn-accept", "button:has-text('Accept')"], timeout=1200)
 
-            filled = await fill_any(
+            filled = await human_type_any(
                 page,
                 [
                     'input[placeholder*="username@example.com"]',
@@ -252,8 +315,8 @@ async def drive_step1_send_code(job: JobState):
                 job.message = job.error
                 return
 
-            await asyncio.sleep(0.5)
-            await click_any(
+            await asyncio.sleep(random.uniform(0.8, 1.5))
+            await human_click(
                 page,
                 [
                     '[data-testid="test-primary-button"]',
@@ -265,7 +328,7 @@ async def drive_step1_send_code(job: JobState):
             )
 
             job.message = "已提交邮箱，正在等待跳转至姓名/验证码页面..."
-            await asyncio.sleep(3.5)
+            await asyncio.sleep(4.0)
             await snap(job)
 
             if err_msg := await detect_block_or_error(page):
@@ -274,18 +337,17 @@ async def drive_step1_send_code(job: JobState):
                 job.message = err_msg
                 return
 
-            for _ in range(4):
-                await click_any(page, ["button#awsccc-cb-btn-accept", "button:has-text('Accept')"], timeout=800)
+            for step_try in range(4):
+                await human_click(page, ["button#awsccc-cb-btn-accept", "button:has-text('Accept')"], timeout=800)
 
                 body_text = (await page.inner_text("body")).lower()
                 if "verification code" in body_text or "verify your email" in body_text or "6-digit" in body_text or "验证码" in body_text:
                     break
 
-                # Check if AWS asks for existing password (if email already registered)
                 pwd_loc = page.locator('input[type="password"]:visible')
                 if await pwd_loc.count() > 0:
                     job.status = "error"
-                    job.error = f"邮箱 {job.email} 似乎已经注册过 AWS Builder ID（页面要求输入已有密码），请换一个新别名序号！"
+                    job.error = f"邮箱 {job.email} 已经注册过 AWS Builder ID，请换一个新别名序号！"
                     job.message = job.error
                     return
 
@@ -293,12 +355,14 @@ async def drive_step1_send_code(job: JobState):
                 if await inputs.count() > 0:
                     inp = inputs.first
                     val = await inp.input_value()
-                    if val.strip() == "" or val.strip() == job.email:
+                    if val.strip() == "" or val.strip() == job.email or "sorry" in body_text:
                         await inp.click()
-                        await inp.fill(job.name)
+                        await asyncio.sleep(0.3)
+                        await inp.fill("")
+                        await inp.press_sequentially(job.name, delay=random.randint(55, 110))
                         await snap(job)
-                        await asyncio.sleep(0.5)
-                        await click_any(
+                        await asyncio.sleep(random.uniform(1.2, 2.2))
+                        await human_click(
                             page,
                             [
                                 '[data-testid="test-primary-button"]',
@@ -308,15 +372,27 @@ async def drive_step1_send_code(job: JobState):
                             ],
                             timeout=5000,
                         )
-                        await asyncio.sleep(3.5)
+                        await asyncio.sleep(4.5)
                         await snap(job)
                         if err_msg := await detect_block_or_error(page):
+                            # Retry once if ERR-837 on first try
+                            if step_try == 0 and "ERR-837" in err_msg:
+                                print(f"[autoreg {job.job_id}] Got ERR-837 on name submit, retrying after pause...", flush=True)
+                                await asyncio.sleep(3)
+                                continue
                             job.status = "error"
                             job.error = err_msg
                             job.message = err_msg
                             return
                 else:
                     await asyncio.sleep(1.5)
+
+            body_text = (await page.inner_text("body")).lower()
+            if "verification code" not in body_text and "verify your email" not in body_text and "6-digit" not in body_text:
+                job.status = "error"
+                job.error = "未能到达验证码输入页面，请查看右侧实时截图"
+                job.message = job.error
+                return
 
             job.status = "waiting_code"
             job.message = f"📩 验证码已发送至你的主 Gmail 收件箱（目标别名: {job.email}）！请输入 6 位验证码："
@@ -357,7 +433,7 @@ async def drive_step2_verify_and_complete(job: JobState, code: str):
             job.status = "verifying"
             job.message = f"正在填入验证码 {code}..."
 
-            filled = await fill_any(
+            filled = await human_type_any(
                 page,
                 [
                     'input[placeholder*="digit"]',
@@ -375,8 +451,8 @@ async def drive_step2_verify_and_complete(job: JobState, code: str):
                 job.message = job.error
                 return
 
-            await asyncio.sleep(0.5)
-            await click_any(
+            await asyncio.sleep(0.8)
+            await human_click(
                 page,
                 [
                     'button:has-text("Verify")',
@@ -406,14 +482,14 @@ async def drive_step2_verify_and_complete(job: JobState, code: str):
             cnt = await pwd_boxes.count()
             if cnt >= 1:
                 await pwd_boxes.nth(0).click()
-                await pwd_boxes.nth(0).fill(job.password)
-                await asyncio.sleep(0.3)
+                await pwd_boxes.nth(0).press_sequentially(job.password, delay=random.randint(35, 70))
+                await asyncio.sleep(0.4)
                 if cnt >= 2:
                     await pwd_boxes.nth(1).click()
-                    await pwd_boxes.nth(1).fill(job.password)
+                    await pwd_boxes.nth(1).press_sequentially(job.password, delay=random.randint(35, 70))
                 await snap(job)
-                await asyncio.sleep(0.5)
-                await click_any(
+                await asyncio.sleep(0.8)
+                await human_click(
                     page,
                     [
                         'button:has-text("Create AWS Builder ID")',
@@ -436,7 +512,7 @@ async def drive_step2_verify_and_complete(job: JobState, code: str):
                     job.error = err_msg
                     job.message = err_msg
                     return
-                await click_any(
+                await human_click(
                     page,
                     [
                         'button:has-text("Allow")',
@@ -483,7 +559,7 @@ async def drive_step2_verify_and_complete(job: JobState, code: str):
                 if job.captured_callback and "code=" in job.captured_callback:
                     break
                 await snap(job)
-                await click_any(
+                await human_click(
                     page,
                     [
                         'button:has-text("Allow")',
