@@ -171,10 +171,13 @@ docker compose up -d quickwork2api
   - **标准异步视频接口**：完整兼容 `/v1/videos`、`/v1/videos/generations`、`/v1/video/generations`（适配 New API 单数视频中继路由），支持 `5s / 6s / 8s / 10s`、`16:9 / 9:16` 及多图/视频/音频参考素材。
   - **对话流式直出模式**：在普通聊天客户端选 `muse-video` 发起对话，SSE 实时推送渲染进度与 `: keepalive` 保活，完成后返回缩略图封面与可点击播放/下载的 MP4 直链（`/v1/media/*.mp4`）。
 
-### 2. 运维面板、Chrome 一键导号与跨区代理隔离
-- **深色运维后台**：`https://<你的域名>/admin`（或 `/muse-admin` 自动跳转），支持查看实时账号池健康状态、各号本周剩余额度百分比、媒体库缩略图预览与在线接口调试。
-- **Chrome / Edge 一键导号插件**：直接在 `/admin` 页面下载 `muse2api-extension.zip` 加载至浏览器，登录 `https://muse.ai/` 后点击扩展图标一键提取含 `HttpOnly` 的 `hatch_sess` Cookie 推送至服务器。
-- **多号独立 IP 出口隔离**：每个 Muse 账号可在后台单独配置代理（如直连美西主节点 + 美东出口节点 `socks5://<美东IP>:18443`），彻底避免多号同 IP 关联风控。
+### 2. 极速 Web 上号器、运维面板与跨区代理隔离
+- **Meta Muse Web 极速上号器（`/muse-login`）**：
+  - 访问地址：`https://<你的域名>/muse-login?key=<MUSE2API_KEY>`（复用 `quick-autoreg` 容器的 Playwright + Xvfb 渲染引擎，零额外内存开销，源码见 [`autoreg/muse_login.py`](autoreg/muse_login.py)）。
+  - 支持 **方式一（服务端邮箱验证码直登）**：直接输入邮箱（支持原样或 Gmail 别名）并选择美西直连/美东出口代理，服务端自动打开 `muse.ai` 回传实时截图，填入收到的邮箱验证码后自动抓取含 `HttpOnly` 的 `hatch_sess` Cookie 写入号池（遇人机验证自动停止提示）。
+  - 支持 **方式二（一键粘贴 Cookie / EditThisCookie JSON）** 与 **方式三（下载 Chrome 一键导号插件）**，并在同页实时监控号池健康状态、剩余额度、绑定代理与一键保活。
+- **完整深色运维后台 & 媒体库**：`https://<你的域名>/admin`（或 `/muse-admin` 自动跳转），支持查看实时账号池健康状态、各号本周剩余额度百分比、媒体库缩略图预览与在线接口调试。
+- **多号独立 IP 出口隔离**：每个 Muse 账号可在上号器或 `/admin` 后台单独配置代理（如直连美西主节点 + 美东出口节点 `socks5://<美东IP>:18443`），彻底避免多号同 IP 关联风控。
 
 ### 3. 一键部署命令
 ```bash
