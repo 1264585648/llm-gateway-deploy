@@ -323,6 +323,36 @@ if "is_health_probe" not in app_code:
         'return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, reference_images=prepared_chat_refs))',
         1
     )
+
+target_media = """@app.get("/v1/media/{name}")
+def get_media(name: str):
+    if "/" in name or "\\\\" in name or ".." in name:
+        raise HTTPException(400, "非法文件名")
+    p = os.path.join(CFG.media_dir, name)
+    if not os.path.isfile(p):
+        raise HTTPException(404, "文件不存在")
+    return FileResponse(p)"""
+
+replace_media = """_MEDIA_MIME = {
+    ".webp": "image/webp", ".png": "image/png", ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg", ".gif": "image/gif", ".mp4": "video/mp4",
+    ".webm": "video/webm", ".mov": "video/quicktime",
+}
+
+
+@app.api_route("/v1/media/{name}", methods=["GET", "HEAD"])
+def get_media(name: str):
+    if "/" in name or "\\\\" in name or ".." in name:
+        raise HTTPException(400, "非法文件名")
+    p = os.path.join(CFG.media_dir, name)
+    if not os.path.isfile(p):
+        raise HTTPException(404, "文件不存在")
+    ext = os.path.splitext(name)[1].lower()
+    return FileResponse(p, media_type=_MEDIA_MIME.get(ext))"""
+
+if "_MEDIA_MIME" not in app_code and target_media in app_code:
+    app_code = app_code.replace(target_media, replace_media, 1)
+
     print("  - app.py patched!")
 
 with open("app.py", "w", encoding="utf-8") as f:
