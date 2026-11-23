@@ -144,6 +144,24 @@ services:
         max-size: "20m"
         max-file: "3"
 
+  quick-autoreg:
+    build: ./autoreg
+    container_name: quick-autoreg
+    restart: unless-stopped
+    shm_size: "1gb"
+    ports:
+      # 仅监听宿主机本地回环，由 Nginx 统一反代 /quick-autoreg/*
+      - "127.0.0.1:8082:8082"
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+    networks:
+      - gateway-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
   muse2api:
     build: ./muse2api
     image: muse2api:latest

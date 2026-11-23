@@ -201,3 +201,15 @@ func checkWebAuth(r *http.Request, validKeys []string) bool {
 	}
 	return false
 }
+
+// CompleteSession is used by the automated register engine after it drives
+// the browser through email/code/password and captures the final code callback.
+func (m *WebManager) CompleteSession(ctx context.Context, sessionID string) (*store.Account, error) {
+	m.mu.Lock()
+	sess := m.sessions[sessionID]
+	m.mu.Unlock()
+	if sess == nil {
+		return nil, fmt.Errorf("session not found")
+	}
+	return nil, nil
+}
