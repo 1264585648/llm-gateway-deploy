@@ -156,7 +156,35 @@ docker compose up -d quickwork2api
 
 ---
 
-## 五、 赠金到期 / 封号：10 分钟平滑迁移 SOP
+## 五、 Meta Muse 多模态号池接入（文本 / 无水印原图 / 视频生成：`muse2api`）
+
+本仓库已集成 **`czg86389-hub/muse2api`** 并附带一键拉取与双模增强脚本 [`scripts/setup_muse2api.sh`](scripts/setup_muse2api.sh)（在 `docker-compose.yml` 中作为 `muse2api` 容器运行），通过无头 Chromium (CDP `BrowserContext` 多账号独立沙箱隔离) + 云端 Hatch VM 保活，把 Meta Muse (`muse.ai`) 的免费周额度（约 1 亿 Token/周/号）转化为标准 OpenAI 兼容多模态 API：
+
+### 1. 支持的模型与双模调用能力
+- **文本 / 代码 / 多模态识图对话 (`muse-spark` / `meta-muse-spark`)**：
+  - 支持 `/v1/chat/completions` 与 `/v1/responses`，并增强了 `engine.py`，支持客户端通过 OpenAI Vision (`image_url`) 上传参考图片进行识图问答。
+- **文生图 & 多参考图编辑 (`muse-image` / `meta-muse-image` / `dall-e-3` / `gpt-image-1`)**：
+  - **标准生图接口**：完整兼容 `/v1/images/generations`、`/v1/images/edits`（支持单图或多达 10 张参考图混合编辑）、`/v1/images/tasks` 异步轮询，自动打开图片查看器抓取无水印原图（实测 `1344x1792`）。
+  - **对话流式直出模式**：在 Cherry Studio / NextChat / LobeChat 等普通聊天客户端直接选 `muse-image` 发文字或发图对话，内部自动调用生图引擎并带 SSE 心跳防断流，生成后以 Markdown 原图直接渲染！
+- **文生视频 & 图生视频 (`muse-video` / `meta-muse-video` / `sora`)**：
+  - **标准异步视频接口**：完整兼容 `/v1/videos`、`/v1/videos/generations`、`/v1/video/generations`（适配 New API 单数视频中继路由），支持 `5s / 6s / 8s / 10s`、`16:9 / 9:16` 及多图/视频/音频参考素材。
+  - **对话流式直出模式**：在普通聊天客户端选 `muse-video` 发起对话，SSE 实时推送渲染进度与 `: keepalive` 保活，完成后返回缩略图封面与可点击播放/下载的 MP4 直链（`/v1/media/*.mp4`）。
+
+### 2. 运维面板、Chrome 一键导号与跨区代理隔离
+- **深色运维后台**：`https://<你的域名>/admin`（或 `/muse-admin` 自动跳转），支持查看实时账号池健康状态、各号本周剩余额度百分比、媒体库缩略图预览与在线接口调试。
+- **Chrome / Edge 一键导号插件**：直接在 `/admin` 页面下载 `muse2api-extension.zip` 加载至浏览器，登录 `https://muse.ai/` 后点击扩展图标一键提取含 `HttpOnly` 的 `hatch_sess` Cookie 推送至服务器。
+- **多号独立 IP 出口隔离**：每个 Muse 账号可在后台单独配置代理（如直连美西主节点 + 美东出口节点 `socks5://<美东IP>:18443`），彻底避免多号同 IP 关联风控。
+
+### 3. 一键部署命令
+```bash
+bash /opt/llm-gateway/scripts/setup_muse2api.sh
+# 在 .env 中填入 MUSE2API_KEY 与 MUSE2API_PUBLIC_BASE=https://<你的域名>
+docker compose up -d --build muse2api
+```
+
+---
+
+## 六、 赠金到期 / 封号：10 分钟平滑迁移 SOP
 
 当 OVH 赠金快用完、准备切到下一家（GCP / Azure / AWS / DigitalOcean / 付费 VPS）时：
 

@@ -144,6 +144,42 @@ services:
         max-size: "20m"
         max-file: "3"
 
+  muse2api:
+    build: ./muse2api
+    image: muse2api:latest
+    container_name: muse2api
+    restart: unless-stopped
+    shm_size: "2gb"
+    ports:
+      # 仅监听宿主机回环供 Nginx 反代 /admin 与 /v1/media，New API 通过 Docker 内网 http://muse2api:18610 调用
+      - "127.0.0.1:18610:18610"
+    volumes:
+      - ./muse2api/data:/app/data
+      - ./muse2api/app.py:/app/app.py
+      - ./muse2api/engine.py:/app/engine.py
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - MUSE2API_KEY=${MUSE2API_KEY:-m2a_change_me_in_env}
+      - MUSE2API_PUBLIC_BASE=${MUSE2API_PUBLIC_BASE:-https://model.yourdomain.com}
+      - MUSE2API_CONCURRENCY=${MUSE2API_CONCURRENCY:-4}
+      - MUSE2API_IMAGE_TIMEOUT=240
+      - MUSE2API_VIDEO_TIMEOUT=600
+      - MUSE2API_CHAT_TIMEOUT=300
+      - MUSE2API_MANAGED_DEPLOYMENT=1
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:18610/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "30m"
+        max-file: "3"
+
 networks:
   gateway-net:
     driver: bridge
