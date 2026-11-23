@@ -123,6 +123,35 @@ func runServer(args []string) int {
 
 	stop, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// Background token keep-alive loop: proactively refresh expiring accounts
+	// every 20 minutes so the admin pool stays green and ready.
+	go func() {
+		ticker := time.NewTicker(20 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop.Done():
+				return
+			case <-ticker.C:
+				list, err := st.Enabled(stop)
+				if err != nil {
+					continue
+				}
+				now := time.Now()
+				for i := range list {
+					a := &list[i]
+					if a.RefreshToken != "" && a.Expiring(now, cfg.RefreshBefore.Duration()+10*time.Minute) {
+						if _, err := mgr.RefreshOne(stop, a.ID); err != nil {
+							log.Printf("background refresh account %d (%s) failed: %v", a.ID, a.Email, err)
+						} else {
+							log.Printf("background refresh account %d (%s) ok", a.ID, a.Email)
+						}
+					}
+				}
+			}
+		}
+	}()
 	listenErr := make(chan error, 1)
 	go func() {
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

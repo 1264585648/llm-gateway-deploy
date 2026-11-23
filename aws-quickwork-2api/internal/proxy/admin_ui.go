@@ -268,15 +268,17 @@ const adminHTMLPage = `<!DOCTYPE html>
 
     <div class="row" style="background:#0b1120;padding:14px;border-radius:10px;border:1px solid var(--border)">
       <label style="font-size:13px;color:var(--muted)">基础 Gmail 邮箱:</label>
-      <input type="text" id="baseEmail" placeholder="例如 rahafsunm7md7@gmail.com" style="width:240px" value="rahafsunm7md7@gmail.com">
+      <input type="text" id="baseEmail" placeholder="例如 rahafsunm7md7@gmail.com" style="width:220px" value="rahafsunm7md7@gmail.com">
       <label style="font-size:13px;color:var(--muted)">别名规则:</label>
       <select id="aliasMode" onchange="updatePreviewAlias()">
-        <option value="plus" selected>+号后缀 (user+q01@gmail.com)</option>
-        <option value="dot">点号变体 (u.ser@gmail.com)</option>
+        <option value="dot" selected>点号变体 (u.ser@gmail.com 推荐)</option>
+        <option value="plus">+号后缀 (user+q01@gmail.com)</option>
         <option value="raw">原样使用输入框邮箱</option>
       </select>
-      <label style="font-size:13px;color:var(--muted)">当前序号:</label>
-      <input type="number" id="aliasStartIdx" value="1" min="1" style="width:68px" onchange="updatePreviewAlias()">
+      <label style="font-size:13px;color:var(--muted)">序号:</label>
+      <input type="number" id="aliasStartIdx" value="1" min="1" style="width:64px" onchange="updatePreviewAlias()">
+      <label style="font-size:13px;color:var(--muted)">住宅代理(可选):</label>
+      <input type="text" id="proxyUrl" placeholder="http://user:pass@ip:port 或留空" style="width:210px">
       <span style="font-size:13px;color:#a78bfa;font-family:monospace" id="previewAlias"></span>
       <button class="purple" onclick="startAutoReg()" style="margin-left:auto">🚀 一键裂变别名 & 发送验证码</button>
     </div>
@@ -325,6 +327,9 @@ if (localStorage.getItem('quick_base_email')) {
 }
 if (localStorage.getItem('quick_alias_idx')) {
   document.getElementById('aliasStartIdx').value = localStorage.getItem('quick_alias_idx');
+}
+if (localStorage.getItem('quick_proxy_url')) {
+  document.getElementById('proxyUrl').value = localStorage.getItem('quick_proxy_url');
 }
 
 function getKey() {
@@ -392,11 +397,15 @@ async function startAutoReg() {
     updatePreviewAlias();
   }
 
+  const proxyUrl = (document.getElementById('proxyUrl').value || '').trim();
+  localStorage.setItem('quick_proxy_url', proxyUrl);
+
   try {
     const data = await api('/quick-autoreg/start', {
       method: 'POST',
       body: JSON.stringify({
         email: targetEmail,
+        proxy: proxyUrl,
         admin_key: getKey()
       })
     });

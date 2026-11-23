@@ -276,10 +276,12 @@ async def drive_step1_send_code(job: JobState):
             await page.route("http://127.0.0.1:18080/**", intercept_callback)
 
             async def log_sso_resp(resp):
-                if "sso.signin.aws" in resp.url and resp.status >= 400:
+                if ("sso.signin.aws" in resp.url or "profile.aws.amazon.com/api/send-otp" in resp.url) and resp.status >= 400:
                     try:
                         txt = await resp.text()
                         print(f"[autoreg {job.job_id}] {resp.status} {resp.url} -> {txt[:300]}", flush=True)
+                        if "BLOCKED" in txt and "TES" in txt:
+                            job.last_api_error = "AWS TES 拦截了当前服务器机房 IP (Request was blocked by TES)。请在上方填入住宅代理，或在本机运行 python scripts/quick_local_autoreg.py！"
                     except Exception:
                         pass
 
@@ -374,8 +376,12 @@ async def drive_step1_send_code(job: JobState):
                         )
                         await asyncio.sleep(4.5)
                         await snap(job)
+                        if job.last_api_error:
+                            job.status = "error"
+                            job.error = job.last_api_error
+                            job.message = job.last_api_error
+                            return
                         if err_msg := await detect_block_or_error(page):
-                            # Retry once if ERR-837 on first try
                             if step_try == 0 and "ERR-837" in err_msg:
                                 print(f"[autoreg {job.job_id}] Got ERR-837 on name submit, retrying after pause...", flush=True)
                                 await asyncio.sleep(3)
@@ -623,3 +629,6 @@ async def get_job_status(job_id: str):
         "account_id": job.account_id,
         "screenshot": job.screenshot_b64,
     }
+
+from muse_login import router as muse_router
+app.include_router(muse_router)
