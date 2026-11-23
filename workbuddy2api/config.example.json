@@ -1,0 +1,45 @@
+{
+  "listen": ":7863",
+  "api_key": "",
+  "auth_dir": "/app/auths",
+  "state_file": "/app/data/state.json",
+  "server": {
+    "read_timeout": "300s"
+  },
+  "panel": {
+    "package_detail_limit": 5,
+    "update_check": true
+  },
+  "global": {
+    "enabled": true
+  },
+  "pool": {
+    "max_in_flight": 3,
+    "max_in_flight_global": 2,
+    "in_flight_wait": "30s",
+    "cross_realm": "merge",
+    "prefer_expiring": true,
+    "expiring_soon": "168h"
+  },
+  "session_sticky": {
+    "enabled": true,
+    "ttl": "30m",
+    "gc_interval": "5m"
+  },
+  "schedule": {
+    "checkin_hours": [9, 21],
+    "growth_hours": [1],
+    "travel_hours": [9, 21],
+    "activity_hours": [10],
+    "keepalive_hours": [22],
+    "blackcat_hours": [23],
+    "checkin_enabled": true,
+    "growth_enabled": true,
+    "travel_enabled": true,
+    "activity_enabled": true,
+    "keepalive_enabled": true,
+    "blackcat_enabled": true,
+    "balance_refresh_enabled": true,
+    "balance_refresh_minutes": 5
+  }
+}

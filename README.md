@@ -6,7 +6,8 @@
 
 ## 核心文档与脚本导航（下次复刻先看这里）
 
-- **[实施步骤与踩坑复刻指南.md](./实施步骤与踩坑复刻指南.md)**：**【强烈推荐首读】** 完整复盘从 0 到 1 上线全流程（7 大阶段 SOP）以及实战中踩过的 **17 个核心暗坑与一键修复命令**（含 Ubuntu 24.04 `ssh.socket` 22222 端口改造、Certbot 免停机续签、AWS Quick 无头容器化、跨 A/B/C 段多 IP `gost` 出口防盗刷等）。
+- **[实施步骤与踩坑复刻指南.md](./实施步骤与踩坑复刻指南.md)**：**【强烈推荐首读】** 完整复盘从 0 到 1 上线全流程（7 大阶段 SOP）以及实战中踩过的核心暗坑与一键修复命令（含 Ubuntu 24.04 `ssh.socket` 22222 端口改造、Certbot 免停机续签、AWS Quick 无头容器化、Meta Muse 多模态、WorkBuddy2API、跨 A/B/C 段多 IP `gost` 出口防盗刷等）。
+- **[docs/插件化架构调研与演进方案.md](./docs/插件化架构调研与演进方案.md)**：针对 `quickwork2api` / `muse2api` / `workbuddy2api` 能否实现插件化的技术调研（对比 New API 原生 `moejs` JS 插件系统 vs 网关编排层 `Compose include + Nginx include + plugin.json` 标准化插件架构）。
 - **[OVH-US-赠金与可开通资源指南.md](./OVH-US-赠金与可开通资源指南.md)**：OVHcloud 美区 `$200` 赠金适用范围、美东/美西配额对比、全机型价格测算与防反扣信用卡清单。
 - **核心自动化脚本与模板**：
   - `scripts/init_server.sh`：主站新机一键初始化（2GB Swap、TCP BBR、`ulimit 65535`、Docker、UFW `22/22222/80/443`、Fail2ban）。

@@ -157,6 +157,26 @@ server {
         proxy_read_timeout 300s;
     }
 
+    # WorkBuddy2API 多号池运维面板 & 多平台管理界面 (/wb-admin/)
+    location = /wb-admin {
+        return 302 /wb-admin/$is_args$args;
+    }
+
+    location ^~ /wb-admin/ {
+        rewrite ^/wb-admin(/.*)$ /panel$1 break;
+        proxy_pass http://127.0.0.1:7863;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Accept-Encoding "";
+        sub_filter '/panel/' '/wb-admin/';
+        sub_filter_once off;
+        sub_filter_types text/javascript application/javascript text/css;
+        proxy_read_timeout 300s;
+    }
+
     # 控制台前端、Playground 与其余路由
     location / {
         proxy_pass http://new_api_backend;

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =========================================================
-# 自动账本备份脚本（MySQL 热备 + 可选加密 + Rclone 上传至 Cloudflare R2）
+# 自动账本备份脚本（MySQL 热备 + 号池凭证打包 + 可选加密 + Rclone 上传至 Cloudflare R2）
 # 赠金机建站保命核心：建议配置 crontab 每 6 小时自动执行一次
-# 例：0 */6 * * * /opt/llm-gateway/scripts/backup.sh >> /var/log/llm-backup.log 2>&1
+# 例：0 */6 * * * /opt/llm-gateway/scripts/backup.sh >> /opt/llm-gateway/backups/backup.log 2>&1
 # =========================================================
 set -euo pipefail
 
@@ -28,6 +28,33 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 SQL_GZ="${BACKUP_DIR}/${MYSQL_DATABASE}_${TIMESTAMP}.sql.gz"
 TARGET_FILE="$SQL_GZ"
 
+upload_r2() {
+  local file="$1"
+  if [[ -n "${RCLONE_REMOTE:-}" ]] && command -v rclone >/dev/null 2>&1; then
+    if rclone listremotes | grep -q "^${RCLONE_REMOTE%%:*}:"; then
+      rclone copy "$file" "${RCLONE_REMOTE}/db/" --transfers 2
+      echo "[$(date '+%F %T')] 已同步至异地存储: ${RCLONE_REMOTE}/db/$(basename "$file")"
+    else
+      echo "[WARN] rclone 尚未配置 remote '${RCLONE_REMOTE%%:*}'，仅保留本地备份"
+    fi
+  fi
+}
+
+encrypt_file_if_configured() {
+  local src="$1"
+  if [[ -n "${BACKUP_ENCRYPT_PASSPHRASE:-}" && "${BACKUP_ENCRYPT_PASSPHRASE}" != "REPLACE_WITH_BACKUP_ENCRYPT_PASS" ]]; then
+    local enc="${src}.enc"
+    openssl enc -aes-256-cbc -salt -pbkdf2 \
+      -pass "pass:${BACKUP_ENCRYPT_PASSPHRASE}" \
+      -in "$src" \
+      -out "$enc"
+    rm -f "$src"
+    echo "$enc"
+  else
+    echo "$src"
+  fi
+}
+
 echo "[$(date '+%F %T')] 开始备份数据库 ${MYSQL_DATABASE}..."
 
 # 使用 --single-transaction 实现 InnoDB 在线热备，不锁表不影响用户调用 API
@@ -41,40 +68,29 @@ docker exec new-api-mysql mysqldump \
   --default-character-set=utf8mb4 \
   "${MYSQL_DATABASE}" | gzip > "$SQL_GZ"
 
-# 若配置了加密口令，则用 AES-256-CBC 加密后再上传对象存储
-if [[ -n "${BACKUP_ENCRYPT_PASSPHRASE:-}" && "${BACKUP_ENCRYPT_PASSPHRASE}" != "REPLACE_WITH_BACKUP_ENCRYPT_PASS" ]]; then
-  ENC_FILE="${SQL_GZ}.enc"
-  openssl enc -aes-256-cbc -salt -pbkdf2 \
-    -pass "pass:${BACKUP_ENCRYPT_PASSPHRASE}" \
-    -in "$SQL_GZ" \
-    -out "$ENC_FILE"
-  rm -f "$SQL_GZ"
-  TARGET_FILE="$ENC_FILE"
-  echo "[$(date '+%F %T')] 备份已加密: $(basename "$TARGET_FILE")"
-fi
+TARGET_FILE="$(encrypt_file_if_configured "$SQL_GZ")"
+echo "[$(date '+%F %T')] 数据库备份就绪: $(basename "$TARGET_FILE")"
+upload_r2 "$TARGET_FILE"
 
-# 上传至异地对象存储（如 Cloudflare R2）
-if [[ -n "${RCLONE_REMOTE:-}" ]] && command -v rclone >/dev/null 2>&1; then
-  if rclone listremotes | grep -q "^${RCLONE_REMOTE%%:*}:"; then
-    rclone copy "$TARGET_FILE" "${RCLONE_REMOTE}/db/" --transfers 2
-    echo "[$(date '+%F %T')] 已同步至异地存储: ${RCLONE_REMOTE}/db/$(basename "$TARGET_FILE")"
-  else
-    echo "[WARN] rclone 尚未配置 remote '${RCLONE_REMOTE%%:*}'，仅保留本地备份"
-  fi
-fi
+# 同步备份各 2API 号池凭证与核心账本（若存在）
+POOLS_TAR="${BACKUP_DIR}/pools_${TIMESTAMP}.tar.gz"
+POOL_PATHS=()
+[[ -f "${PROJECT_DIR}/aws-quickwork-2api/data/quickwork.db" ]] && POOL_PATHS+=("aws-quickwork-2api/data/quickwork.db" "aws-quickwork-2api/config.json")
+[[ -d "${PROJECT_DIR}/workbuddy2api/auths" ]] && POOL_PATHS+=("workbuddy2api/auths" "workbuddy2api/config.json")
+[[ -f "${PROJECT_DIR}/workbuddy2api/data/state.json" ]] && POOL_PATHS+=("workbuddy2api/data/state.json")
+[[ -f "${PROJECT_DIR}/workbuddy2api/data/api_keys.json" ]] && POOL_PATHS+=("workbuddy2api/data/api_keys.json")
+[[ -f "${PROJECT_DIR}/workbuddy2api/data/providers.json" ]] && POOL_PATHS+=("workbuddy2api/data/providers.json")
+[[ -f "${PROJECT_DIR}/workbuddy2api/data/proxies.json" ]] && POOL_PATHS+=("workbuddy2api/data/proxies.json")
+[[ -f "${PROJECT_DIR}/muse2api/data/accounts.json" ]] && POOL_PATHS+=("muse2api/data/accounts.json")
 
-# 同步备份 AWS Quick 多号池 SQLite 账本（如存在）
-QUICK_DB="${PROJECT_DIR}/aws-quickwork-2api/data/quickwork.db"
-if [[ -f "$QUICK_DB" ]]; then
-  QUICK_BAK="${BACKUP_DIR}/quickwork_${TIMESTAMP}.db.gz"
-  gzip -c "$QUICK_DB" > "$QUICK_BAK"
-  echo "[$(date '+%F %T')] 已备份 AWS Quick 号池数据库: $(basename "$QUICK_BAK")"
-  if [[ -n "${RCLONE_REMOTE:-}" ]] && command -v rclone >/dev/null 2>&1 && rclone listremotes | grep -q "^${RCLONE_REMOTE%%:*}:"; then
-    rclone copy "$QUICK_BAK" "${RCLONE_REMOTE}/db/" --transfers 2
-  fi
+if [[ ${#POOL_PATHS[@]} -gt 0 ]]; then
+  tar -czf "$POOLS_TAR" -C "$PROJECT_DIR" "${POOL_PATHS[@]}"
+  POOLS_FINAL="$(encrypt_file_if_configured "$POOLS_TAR")"
+  echo "[$(date '+%F %T')] 号池凭证备份就绪: $(basename "$POOLS_FINAL")"
+  upload_r2 "$POOLS_FINAL"
 fi
 
 # 清理过期的本地备份
 RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
-find "$BACKUP_DIR" -type f \( -name "*.sql.gz" -o -name "*.sql.gz.enc" -o -name "*.db.gz" \) -mtime "+${RETENTION_DAYS}" -delete
+find "$BACKUP_DIR" -type f \( -name "*.sql.gz" -o -name "*.sql.gz.enc" -o -name "*.db.gz" -o -name "*.tar.gz" -o -name "*.tar.gz.enc" \) -mtime "+${RETENTION_DAYS}" -delete
 echo "[$(date '+%F %T')] 备份流程结束（本地保留最近 ${RETENTION_DAYS} 天）。"

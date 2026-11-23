@@ -1,6 +1,6 @@
 # =========================================================
 # AI API 中转站生产级编排（云无关 / 适配 OVH 等各类赠金机）
-# 架构：Nginx(宿主机反代) -> New API + MySQL 8 + Redis 7 + Uptime Kuma
+# 架构：Nginx(宿主机反代) -> New API + MySQL 8 + Redis 7 + Uptime Kuma + 各 2API 号池
 # 安全红线：所有应用与数据库端口均不暴露至 0.0.0.0 公网
 # =========================================================
 
@@ -124,7 +124,7 @@ services:
     working_dir: /app
     command: ["/bin/sh", "-c", "apk add --no-cache ca-certificates tzdata >/dev/null 2>&1 || true; exec /app/bin/quickproxy server -config /app/config.json"]
     ports:
-      # 仅监听宿主机回环供本机调试，New API 通过 Docker 内网 http://quickwork2api:8080 直接调用
+      # 仅监听宿主机回环供 Nginx 反代 /quick-admin，New API 通过 Docker 内网 http://quickwork2api:8080 调用
       - "127.0.0.1:8081:8080"
     volumes:
       - ./aws-quickwork-2api:/app
@@ -196,6 +196,36 @@ services:
       driver: "json-file"
       options:
         max-size: "30m"
+        max-file: "3"
+
+  workbuddy2api:
+    image: ghcr.io/yreidev/workbuddy2api-panel:latest
+    container_name: workbuddy2api
+    restart: unless-stopped
+    user: "1000:1000"
+    command: ["-config", "/app/config.json"]
+    ports:
+      # 仅监听宿主机回环供 Nginx 反代 /wb-admin/，New API 通过 Docker 内网 http://workbuddy2api:7863 调用
+      - "127.0.0.1:7863:7863"
+    volumes:
+      - ./workbuddy2api/auths:/app/auths
+      - ./workbuddy2api/data:/app/data
+      - ./workbuddy2api/config.json:/app/config.json
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - WB2A_API_KEY=${WB2A_API_KEY:-wb2a_change_me_in_env}
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:7863/readyz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
         max-file: "3"
 
 networks:
