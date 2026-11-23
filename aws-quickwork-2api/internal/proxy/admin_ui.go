@@ -350,13 +350,25 @@ function generateAlias(baseEmail, mode, index) {
   const domain = parts[1];
   if ((mode === 'dot' || mode === 'dot_rand') && local.length > 2) {
     const clean = local.replace(/\./g, '');
-    const mask = mode === 'dot_rand'
-      ? Math.max(1, Math.floor(Math.random() * ((1 << Math.min(clean.length - 1, 16)) - 1)) + 1)
-      : index;
+    const maxPos = clean.length - 1;
+    if (mode === 'dot_rand') {
+      // Pick 1 or 2 natural dot positions
+      const dotCount = Math.random() < 0.5 ? 1 : Math.min(2, maxPos);
+      const chosen = new Set();
+      while (chosen.size < dotCount) {
+        chosen.add(Math.floor(Math.random() * maxPos));
+      }
+      let out = '';
+      for (let i = 0; i < clean.length; i++) {
+        out += clean[i];
+        if (chosen.has(i)) out += '.';
+      }
+      return out + '@' + domain;
+    }
     let out = '';
     for (let i = 0; i < clean.length; i++) {
       out += clean[i];
-      if (i < clean.length - 1 && ((mask >> i) & 1)) {
+      if (i < maxPos && ((index >> i) & 1)) {
         out += '.';
       }
     }

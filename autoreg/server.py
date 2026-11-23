@@ -191,7 +191,17 @@ async def start_register(req: StartRequest):
     password = (req.password or "").strip() or random_password()
     raw_proxy = (req.proxy or "").strip()
     proxy_pool = [p.strip() for p in raw_proxy.replace("\n", ",").replace(";", ",").split(",") if p.strip()]
-    proxy = random.choice(proxy_pool) if proxy_pool else "" 
+    if proxy_pool:
+        proxy = random.choice(proxy_pool)
+    else:
+        # Auto-detect bridged local Clash tunnel on 172.18.0.1:17890 if active
+        import socket
+        proxy = ""
+        try:
+            with socket.create_connection(("172.18.0.1", 17890), timeout=0.3):
+                proxy = "http://172.18.0.1:17890"
+        except Exception:
+            pass 
 
     job = JobState(job_id, email, name, password, req.admin_key, proxy=proxy)
     job.session_id = sess_data["id"]
