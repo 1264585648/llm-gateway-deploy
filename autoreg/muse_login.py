@@ -1,10 +1,14 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import os
+import re
+import struct
 import time
 import urllib.parse
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import APIRouter, HTTPException
@@ -17,14 +21,69 @@ DEFAULT_EGRESS_PROXY = os.environ.get("MUSE_DEFAULT_PROXY", "").strip()
 router = APIRouter()
 
 
+def _normalize_totp_secret(raw: str) -> str:
+    """支持裸 Base32 密钥（含空格/横杠）或 otpauth://totp/...?secret=XXX 格式。"""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s.lower().startswith("otpauth://"):
+        parsed = urllib.parse.urlsplit(s)
+        q = urllib.parse.parse_qs(parsed.query)
+        s = (q.get("secret") or [""])[0].strip()
+    s = re.sub(r"[\s\-]+", "", s).upper()
+    return s
+
+
+def _generate_totp(secret_raw: str, digits: int = 6, interval: int = 30) -> str:
+    """标准 RFC 6238 TOTP 生成器（纯标准库实现）；若用户输入的是纯 6~8 位数字则直接原样返回。"""
+    s = _normalize_totp_secret(secret_raw)
+    if not s:
+        raise ValueError("2FA 密钥为空")
+    if s.isdigit() and 4 <= len(s) <= 8:
+        return s
+    # Pad Base32 to multiple of 8
+    pad_len = (-len(s)) % 8
+    try:
+        key = base64.b32decode(s + ("=" * pad_len), casefold=True)
+    except Exception as exc:
+        raise ValueError(f"2FA 密钥不是合法的 Base32 字符串: {exc}") from exc
+    counter = int(time.time()) // interval
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code_int = (struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code_int).zfill(digits)
+
+
+async def _fresh_totp(secret_raw: str) -> str:
+    """若当前 30 秒 TOTP 窗口剩余不足 3 秒，自动等待进入下一个窗口防验证码途中过期。"""
+    s = _normalize_totp_secret(secret_raw)
+    if not (s.isdigit() and 4 <= len(s) <= 8):
+        rem = 30 - (int(time.time()) % 30)
+        if rem <= 3:
+            await asyncio.sleep(rem + 0.6)
+    return _generate_totp(secret_raw)
+
+
 class MuseJobState:
-    def __init__(self, job_id: str, email: str, label: str, proxy_url: str, admin_key: str):
+    def __init__(
+        self,
+        job_id: str,
+        email: str,
+        password: str,
+        totp_secret: str,
+        label: str,
+        proxy_url: str,
+        admin_key: str,
+    ):
         self.job_id = job_id
         self.email = email
+        self.password = password
+        self.totp_secret = _normalize_totp_secret(totp_secret)
         self.label = label or email
         self.proxy_url = (proxy_url or "").strip()
         self.admin_key = admin_key
-        # starting | sending_code | waiting_code | waiting_input | verifying | blocked | done | error
+        # queued | starting | logging_in | waiting_code | waiting_input | verifying | blocked | done | error
         self.status = "starting"
         self.message = "正在启动无头浏览器并打开 muse.ai 登录页..."
         self.error = ""
@@ -40,6 +99,8 @@ class MuseJobState:
 
 
 muse_jobs: Dict[str, MuseJobState] = {}
+# Limit concurrent headless login contexts to 2 so Chromium RAM stays low & clean
+_LOGIN_SEM = asyncio.Semaphore(2)
 
 
 def _parse_playwright_proxy(proxy_url: str) -> Optional[Dict[str, str]]:
@@ -87,7 +148,7 @@ async def _cleanup_job(job: MuseJobState):
 
 def _prune_old_jobs():
     now = time.time()
-    stale = [jid for jid, j in muse_jobs.items() if now - j.created_at > 1800]
+    stale = [jid for jid, j in muse_jobs.items() if now - j.created_at > 3600]
     for jid in stale:
         j = muse_jobs.pop(jid, None)
         if j and j.context:
@@ -120,19 +181,22 @@ async def _detect_block(page: Page) -> Optional[str]:
     captcha_kw = (
         "captcha", "verify you are human", "human verification",
         "complete the security check", "arkose", "turnstile",
-        "security puzzle", "not a robot", "人机验证", "安全验证"
+        "security puzzle", "not a robot", "confirm you're human",
+        "confirm you are human", "人机验证", "安全验证"
     )
     if any(k in body for k in captcha_kw):
-        return "Muse/Meta 页面触发了人机验证（CAPTCHA）。遵循安全规范已停止自动化，请改用本地浏览器登录后使用 Chrome 扩展一键导入。"
+        return "Muse/Meta 页面触发了人机验证（CAPTCHA）。遵循安全规范已停止自动化，请查看右侧截图并改用本地浏览器登录后通过 Chrome 扩展导入。"
     if "not available in your country" in body or "not available in your region" in body or "地区不可用" in body:
         return "当前出口地区受限，请切换至美区直连或自定义美区 SOCKS5/HTTP 出口代理后重试。"
-    if "credit card" in body or "add a payment method" in body or "billing" in body and "card number" in body:
+    if "credit card" in body or "add a payment method" in body or ("billing" in body and "card number" in body):
         return "页面要求绑定支付方式/信用卡验证，已停止自动化，请查看右侧截图并在本地浏览器完成。"
+    if "account has been locked" in body or "account has been disabled" in body or "suspended" in body and "appeal" in body:
+        return "该账号在 Meta 侧处于锁定或风控状态，请查看右侧截图。"
     return None
 
 
 async def _detect_error_banner(page: Page) -> Optional[str]:
-    for sel in ('[role="alert"]', '[aria-live="assertive"]', '[data-testid*="error" i]'):
+    for sel in ('[role="alert"]', '[aria-live="assertive"]', '[data-testid*="error" i]', '.error_box'):
         try:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=250):
@@ -144,7 +208,7 @@ async def _detect_error_banner(page: Page) -> Optional[str]:
     return None
 
 
-async def _click_any(page: Page, selectors, timeout=3500) -> bool:
+async def _click_any(page: Page, selectors, timeout=2500) -> bool:
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -156,7 +220,7 @@ async def _click_any(page: Page, selectors, timeout=3500) -> bool:
     return False
 
 
-async def _fill_any(page: Page, selectors, text: str, timeout=5000) -> bool:
+async def _fill_any(page: Page, selectors, text: str, timeout=4000) -> bool:
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -219,7 +283,7 @@ async def _extract_and_import_cookies(job: MuseJobState) -> bool:
     job.status = "done"
     job.error = ""
     job.message = (
-        f"🎉 登录并入池成功！账号 {job.label}（ID: {job.account_id}，提取 {job.cookie_count} 条 Cookie，"
+        f"🎉 自动登录并入池成功！账号 {job.label}（ID: {job.account_id}，提取 {job.cookie_count} 条 Cookie，"
         f"含核心 HttpOnly hatch_sess）已加入 Meta Muse 号池！"
     )
     await _snap(job)
@@ -228,150 +292,373 @@ async def _extract_and_import_cookies(job: MuseJobState) -> bool:
 
 
 async def _get_shared_browser():
-    # Reuse the headed/Xvfb Playwright browser instance from server.py
     import server as srv
     return await srv.get_browser()
 
 
-async def _drive_step1(job: MuseJobState):
-    async with job.lock:
-        try:
-            browser = await _get_shared_browser()
-            ctx_kwargs: Dict[str, Any] = {
-                "viewport": {"width": 1280, "height": 800},
-                "locale": "en-US",
-                "timezone_id": "America/Los_Angeles",
-                "user_agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
-            }
-            pw_proxy = _parse_playwright_proxy(job.proxy_url)
-            if pw_proxy:
-                ctx_kwargs["proxy"] = pw_proxy
-
-            context = await browser.new_context(**ctx_kwargs)
-            page = await context.new_page()
-            job.context = context
-            job.page = page
-
-            job.status = "sending_code"
-            job.message = f"正在打开 https://muse.ai/ 并填入邮箱 {job.email}..."
-            await page.goto("https://muse.ai/", wait_until="domcontentloaded", timeout=35000)
-            await asyncio.sleep(3.0)
-            await _snap(job)
-
-            if blk := await _detect_block(page):
-                job.status = "blocked"
-                job.error = blk
-                job.message = blk
-                return
-
-            # Some screens hide the form behind a "Log in" button
-            email_selectors = [
-                'input[placeholder*="Mobile number or email" i]',
-                'input[placeholder*="email" i]',
-                'input[type="email"]',
-                'input[name="email"]',
-                'input[type="text"]',
-            ]
-            filled = await _fill_any(page, email_selectors, job.email, timeout=6000)
-            if not filled:
-                await _click_any(page, ['button:has-text("Log in")', 'a:has-text("Log in")'], timeout=3000)
-                await asyncio.sleep(2.0)
-                filled = await _fill_any(page, email_selectors, job.email, timeout=6000)
-
-            await _snap(job)
-            if not filled:
-                job.status = "error"
-                job.error = "未找到 muse.ai 邮箱输入框，请查看右侧实时截图。"
-                job.message = job.error
-                return
-
-            await asyncio.sleep(0.4)
-            await _click_any(
-                page,
-                [
-                    'button[type="submit"]',
-                    'button:has-text("Continue")',
-                    'button:has-text("Next")',
-                    'button:has-text("继续")',
-                ],
-                timeout=5000,
-            )
-
-            job.message = "已提交邮箱，正在等待跳转至验证码/登录验证页面..."
-            await asyncio.sleep(4.5)
-            await _snap(job)
-
-            if await _extract_and_import_cookies(job):
-                return
-
-            if blk := await _detect_block(page):
-                job.status = "blocked"
-                job.error = blk
-                job.message = blk
-                return
-
-            if err_b := await _detect_error_banner(page):
-                job.status = "waiting_input"
-                job.hint = f"页面提示: {err_b}"
-                job.message = f"页面出现提示，请查看右侧截图并根据页面要求输入内容（如验证码/密码）"
-                return
-
-            body = (await page.inner_text("body")).lower()
-            pwd_count = await page.locator('input[type="password"]:visible').count()
-            if pwd_count > 0 and "code" not in body and "verification" not in body:
-                job.status = "waiting_code"
-                job.hint = "password"
-                job.message = f"页面要求输入密码或登录凭证（{job.email}），请在下方填写并提交。"
-            else:
-                job.status = "waiting_code"
-                job.hint = "otp"
-                job.message = f"已向 {job.email} 触发登录流程！请查看右侧实时画面，并在下方填入收到的邮箱验证码（或页面要求的字段）。"
-        except Exception as exc:
-            job.status = "error"
-            job.error = f"启动登录异常: {exc}"
-            job.message = job.error
-            await _snap(job)
-
-
-async def _fill_code_or_text(page: Page, value: str) -> bool:
+async def _fill_code_or_text(page: Page, value: str, prefer_code: bool = False) -> bool:
     val = value.strip()
-    # 1. Check split OTP boxes (4-8 single-char inputs)
     split_boxes = page.locator('input[maxlength="1"]:visible')
     if 4 <= await split_boxes.count() <= 8 and val.isdigit():
         await split_boxes.first.click()
-        await page.keyboard.type(val, delay=70)
+        await page.keyboard.type(val, delay=65)
         return True
 
-    # 2. Check password field if visible
-    pwd = page.locator('input[type="password"]:visible')
-    if await pwd.count() > 0:
-        await pwd.first.click()
-        await pwd.first.fill(val)
-        return True
+    if not prefer_code:
+        pwd = page.locator('input[type="password"]:visible')
+        if await pwd.count() > 0:
+            await pwd.first.click()
+            await pwd.first.fill(val)
+            return True
 
-    # 3. Single OTP / text input
     return await _fill_any(
         page,
         [
             'input[autocomplete="one-time-code"]',
-            'input[inputmode="numeric"]',
+            'input[name="approvals_code"]',
             'input[name*="code" i]',
+            'input[inputmode="numeric"]',
             'input[placeholder*="code" i]',
             'input[placeholder*="otp" i]',
-            'input[placeholder*="name" i]',
+            'input[aria-label*="code" i]',
             'input[type="tel"]',
             'input[type="number"]',
             'input[type="text"]',
         ],
         val,
-        timeout=5000,
+        timeout=4000,
     )
 
 
-async def _drive_verify(job: MuseJobState, code: str, extra_name: str = ""):
+async def _submit_form_button(page: Page) -> bool:
+    clicked = await _click_any(
+        page,
+        [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Log in")',
+            'button:has-text("Log In")',
+            'button:has-text("Continue")',
+            'button:has-text("Verify")',
+            'button:has-text("Submit")',
+            'button:has-text("Next")',
+            'button:has-text("Confirm")',
+            'button:has-text("登录")',
+            'button:has-text("继续")',
+            'button:has-text("确认")',
+        ],
+        timeout=2500,
+    )
+    if not clicked:
+        try:
+            await page.keyboard.press("Enter")
+            return True
+        except Exception:
+            return False
+    return clicked
+
+
+async def _drive_auto_login(job: MuseJobState):
+    async with _LOGIN_SEM:
+        async with job.lock:
+            try:
+                job.status = "starting"
+                job.message = f"正在启动浏览器并打开 https://muse.ai/（账号 {job.email}）..."
+                browser = await _get_shared_browser()
+                ctx_kwargs: Dict[str, Any] = {
+                    "viewport": {"width": 1280, "height": 800},
+                    "locale": "en-US",
+                    "timezone_id": "America/Los_Angeles",
+                    "user_agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                }
+                pw_proxy = _parse_playwright_proxy(job.proxy_url)
+                if pw_proxy:
+                    ctx_kwargs["proxy"] = pw_proxy
+
+                context = await browser.new_context(**ctx_kwargs)
+                page = await context.new_page()
+                job.context = context
+                job.page = page
+
+                await page.goto("https://muse.ai/", wait_until="domcontentloaded", timeout=35000)
+                await asyncio.sleep(3.0)
+                await _snap(job)
+
+                if blk := await _detect_block(page):
+                    job.status = "blocked"
+                    job.error = blk
+                    job.message = blk
+                    return
+
+                # Step 1: Fill email / mobile / username on muse.ai landing page
+                email_selectors = [
+                    'input[placeholder*="Mobile number or email" i]',
+                    'input[placeholder*="email" i]',
+                    'input[type="email"]',
+                    'input[name="email"]',
+                    'input[type="text"]',
+                ]
+                filled = await _fill_any(page, email_selectors, job.email, timeout=6000)
+                if not filled:
+                    await _click_any(page, ['button:has-text("Log in")', 'a:has-text("Log in")'], timeout=3000)
+                    await asyncio.sleep(2.0)
+                    filled = await _fill_any(page, email_selectors, job.email, timeout=6000)
+
+                await _snap(job)
+                if not filled:
+                    job.status = "error"
+                    job.error = "未找到 muse.ai 邮箱输入框，请查看右侧实时截图。"
+                    job.message = job.error
+                    return
+
+                await asyncio.sleep(0.35)
+                await _submit_form_button(page)
+                job.status = "logging_in"
+                job.message = f"已提交账号 {job.email}，正在自动推进密码与 2FA 校验..."
+                await asyncio.sleep(4.0)
+                await _snap(job)
+
+                # Step 2: Intelligent state machine loop for Password -> 2FA (TOTP) -> Trust Device -> Cookie Extraction
+                pwd_attempts = 0
+                totp_attempts = 0
+                switched_2fa_method = False
+
+                for step_i in range(18):
+                    if await _extract_and_import_cookies(job):
+                        return
+
+                    if blk := await _detect_block(page):
+                        job.status = "blocked"
+                        job.error = blk
+                        job.message = blk
+                        return
+
+                    try:
+                        body = (await page.inner_text("body")).lower()
+                    except Exception:
+                        body = ""
+
+                    # Handle Meta/Facebook cookie consent banners if any
+                    await _click_any(
+                        page,
+                        [
+                            'button:has-text("Allow all cookies")',
+                            'button:has-text("Accept all")',
+                            'button[data-cookiebanner="accept_button"]',
+                        ],
+                        timeout=400,
+                    )
+
+                    # Case A: Password field visible
+                    pwd_loc = page.locator('input[type="password"]:visible')
+                    if await pwd_loc.count() > 0:
+                        if not job.password:
+                            job.status = "waiting_code"
+                            job.hint = "password"
+                            job.message = f"页面要求输入密码（{job.email}），因未预先填写密码，请在下方输入并提交。"
+                            await _snap(job)
+                            return
+
+                        if pwd_attempts >= 2:
+                            err_b = await _detect_error_banner(page)
+                            job.status = "error"
+                            job.error = f"密码提交后未能通过（{err_b or '请检查账号密码是否正确，查看右侧截图'}）"
+                            job.message = job.error
+                            await _snap(job)
+                            return
+
+                        # If Facebook/Meta login page ALSO shows an empty email box alongside password, fill it too
+                        email_box = page.locator('input[name="email"]:visible, input[type="email"]:visible').first
+                        try:
+                            if await email_box.is_visible(timeout=250) and not (await email_box.input_value()).strip():
+                                await email_box.fill(job.email)
+                        except Exception:
+                            pass
+
+                        job.message = f"检测到密码输入页，正在自动填入密码并登录（第 {pwd_attempts + 1} 次）..."
+                        await pwd_loc.first.click()
+                        await pwd_loc.first.fill(job.password)
+                        pwd_attempts += 1
+                        await _snap(job)
+                        await asyncio.sleep(0.35)
+                        await _submit_form_button(page)
+                        await asyncio.sleep(4.0)
+                        await _snap(job)
+                        continue
+
+                    # Case B: Intermediate choice page asking "Log in with password" / "Continue with Facebook"
+                    if job.password and pwd_attempts == 0:
+                        clicked_pwd_choice = await _click_any(
+                            page,
+                            [
+                                'button:has-text("Log in with password")',
+                                'button:has-text("Use password")',
+                                'a:has-text("Log in with password")',
+                                'button:has-text("Enter password")',
+                                'button:has-text("使用密码登录")',
+                            ],
+                            timeout=500,
+                        )
+                        if clicked_pwd_choice:
+                            job.message = "已选择「使用密码登录」，正在加载密码框..."
+                            await asyncio.sleep(2.5)
+                            await _snap(job)
+                            continue
+
+                    # Case C: Meta 2FA defaulted to "Check your notifications on another device" -> switch to Authenticator App
+                    is_other_device_2fa = (
+                        job.totp_secret
+                        and not switched_2fa_method
+                        and (
+                            "check your notifications on another device" in body
+                            or "waiting for approval" in body
+                            or "check your whatsapp" in body
+                            or "text message (sms)" in body
+                            or "在其他设备上查看通知" in body
+                        )
+                    )
+                    if is_other_device_2fa:
+                        job.message = "检测到默认设备通知审批，正在自动切换至「身份验证器 App (2FA)」..."
+                        clicked_try = await _click_any(
+                            page,
+                            [
+                                'button:has-text("Try another way")',
+                                'a:has-text("Try another way")',
+                                'div[role="button"]:has-text("Try another way")',
+                                'button:has-text("尝试其他方式")',
+                                'button:has-text("Other ways")',
+                            ],
+                            timeout=1800,
+                        )
+                        if clicked_try:
+                            switched_2fa_method = True
+                            await asyncio.sleep(2.0)
+                            await _snap(job)
+                            await _click_any(
+                                page,
+                                [
+                                    'label:has-text("Authentication app")',
+                                    'div[role="radio"]:has-text("Authentication app")',
+                                    'span:has-text("Authentication app")',
+                                    'span:has-text("Authenticator app")',
+                                    'span:has-text("身份验证应用")',
+                                ],
+                                timeout=2000,
+                            )
+                            await asyncio.sleep(0.5)
+                            await _submit_form_button(page)
+                            await asyncio.sleep(3.0)
+                            await _snap(job)
+                            continue
+
+                    # Case D: 2FA / OTP Code input screen
+                    is_code_screen = any(
+                        kw in body
+                        for kw in (
+                            "authentication app", "authenticator", "login code",
+                            "two-factor", "6-digit", "verification code",
+                            "security code", "enter code", "enter the code",
+                            "check your email", "we sent a code",
+                            "双重验证", "身份验证", "验证码",
+                        )
+                    )
+                    code_input_present = (
+                        await page.locator(
+                            'input[maxlength="1"]:visible, input[autocomplete="one-time-code"]:visible, '
+                            'input[name="approvals_code"]:visible, input[name*="code" i]:visible, '
+                            'input[inputmode="numeric"]:visible, input[placeholder*="code" i]:visible, '
+                            'input[type="tel"]:visible, input[type="number"]:visible, input[type="text"]:visible'
+                        ).count() > 0
+                    )
+
+                    if is_code_screen and code_input_present:
+                        # Distinguish between 2FA TOTP app code vs Email OTP when user only supplied email (no password/2fa)
+                        is_email_otp = ("check your email" in body or "sent to your email" in body or "邮箱" in body) and not (
+                            "authentication app" in body or "authenticator" in body or "two-factor" in body
+                        )
+                        if job.totp_secret and not is_email_otp:
+                            if totp_attempts >= 2:
+                                err_b = await _detect_error_banner(page)
+                                job.status = "waiting_code"
+                                job.hint = "otp"
+                                job.message = f"自动填入 2FA 验证码后未通过（{err_b or '请核对 2FA 密钥或查看右侧截图手动输入'}）"
+                                await _snap(job)
+                                return
+
+                            totp_code = await _fresh_totp(job.totp_secret)
+                            job.message = f"检测到 2FA 验证页，已实时计算 6 位 TOTP 验证码 ({totp_code}) 并自动提交..."
+                            filled_code = await _fill_code_or_text(page, totp_code, prefer_code=True)
+                            totp_attempts += 1
+                            await _snap(job)
+                            if filled_code:
+                                await asyncio.sleep(0.4)
+                                await _submit_form_button(page)
+                                await asyncio.sleep(4.5)
+                                await _snap(job)
+                                continue
+                        else:
+                            job.status = "waiting_code"
+                            job.hint = "otp"
+                            job.message = f"页面需要输入{'邮箱验证码' if is_email_otp else '2FA 验证码'}（{job.email}），请查看右侧截图并在下方提交。"
+                            await _snap(job)
+                            return
+
+                    # Case E: Post-2FA "Trust this device" / "Save browser" / "Continue as ..." / "I agree"
+                    visible_inputs = page.locator(
+                        'input[type="text"]:visible, input[type="password"]:visible, '
+                        'input[type="email"]:visible, input[type="tel"]:visible, input[inputmode="numeric"]:visible'
+                    )
+                    if await visible_inputs.count() == 0:
+                        clicked_post = await _click_any(
+                            page,
+                            [
+                                'button:has-text("Trust this device")',
+                                'button:has-text("Always confirm")',
+                                'button:has-text("Save browser")',
+                                'button:has-text("Continue as")',
+                                'button:has-text("Continue")',
+                                'button:has-text("I agree")',
+                                'button:has-text("Agree")',
+                                'button:has-text("Accept")',
+                                'button:has-text("Get started")',
+                                'button:has-text("Skip")',
+                                'button:has-text("信任此设备")',
+                                'button:has-text("继续")',
+                            ],
+                            timeout=700,
+                        )
+                        if clicked_post:
+                            job.message = "正在确认设备信任与工作区授权跳转..."
+                            await asyncio.sleep(3.5)
+                            await _snap(job)
+                            continue
+
+                    # If we're on a non-muse domain (e.g. facebook.com/meta.com) and already authenticated, navigate back to muse.ai once
+                    if step_i in (10, 14) and "muse.ai" not in page.url.lower():
+                        await asyncio.sleep(2.0)
+                    else:
+                        await asyncio.sleep(2.0)
+                    await _snap(job)
+
+                # Reached end of auto loop without hatch_sess -> hand over gracefully to interactive mode
+                err_b = await _detect_error_banner(page)
+                job.status = "waiting_input"
+                job.message = (
+                    f"自动推进暂停（{err_b or '当前页面需人工确认或额外输入'}）。"
+                    "请查看右侧实时画面：可输入页面所需内容点提交，或若已进首页可直接点「🍪 立即提取 Cookie 入池」。"
+                )
+                await _snap(job)
+            except Exception as exc:
+                job.status = "error"
+                job.error = f"自动登录异常: {exc}"
+                job.message = job.error
+                await _snap(job)
+
+
+async def _drive_manual_verify(job: MuseJobState, code: str, extra_name: str = ""):
     async with job.lock:
         if not job.page or not job.context:
             job.status = "error"
@@ -383,36 +670,20 @@ async def _drive_verify(job: MuseJobState, code: str, extra_name: str = ""):
         try:
             job.status = "verifying"
             job.error = ""
-            job.message = "正在提交验证码/登录凭证..."
+            job.message = "正在提交人工输入的凭证/验证码..."
 
             if code.strip():
                 ok = await _fill_code_or_text(page, code)
                 await _snap(job)
                 if not ok:
                     job.status = "waiting_input"
-                    job.message = "当前页面未找到输入框，请查看右侧截图（若已进入工作区可点「立即提取 Cookie 入池」）。"
+                    job.message = "当前页面未找到输入框，请查看右侧截图（若已登录可点「立即提取 Cookie 入池」）。"
                     return
-                await asyncio.sleep(0.4)
-                clicked = await _click_any(
-                    page,
-                    [
-                        'button[type="submit"]',
-                        'button:has-text("Continue")',
-                        'button:has-text("Verify")',
-                        'button:has-text("Next")',
-                        'button:has-text("Log in")',
-                        'button:has-text("Submit")',
-                        'button:has-text("确认")',
-                        'button:has-text("继续")',
-                    ],
-                    timeout=3500,
-                )
-                if not clicked:
-                    await page.keyboard.press("Enter")
+                await asyncio.sleep(0.35)
+                await _submit_form_button(page)
 
-            # Poll for hatch_sess or next step (up to ~24s)
             for _ in range(12):
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(2.2)
                 await _snap(job)
 
                 if await _extract_and_import_cookies(job):
@@ -424,23 +695,36 @@ async def _drive_verify(job: MuseJobState, code: str, extra_name: str = ""):
                     job.message = blk
                     return
 
-                # If user provided an optional display name and Muse asks for name
                 if extra_name.strip():
                     name_inp = page.locator('input[placeholder*="name" i]:visible, input[name*="name" i]:visible').first
                     try:
                         if await name_inp.is_visible(timeout=200) and not (await name_inp.input_value()).strip():
                             await name_inp.fill(extra_name.strip())
-                            await _click_any(page, ['button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Next")'], timeout=1500)
+                            await _submit_form_button(page)
                             continue
                     except Exception:
                         pass
 
-                # Auto-click harmless onboarding continue/agree buttons only when no empty text/password inputs remain
-                visible_inputs = page.locator('input[type="text"]:visible, input[type="password"]:visible, input[type="email"]:visible, input[type="tel"]:visible, input[inputmode="numeric"]:visible')
+                # If a 2FA screen appears AFTER manual password entry and user supplied totp_secret, auto-fill it!
+                body = (await page.inner_text("body")).lower()
+                if job.totp_secret and any(k in body for k in ("authentication app", "authenticator", "two-factor", "login code", "6-digit")):
+                    totp_code = await _fresh_totp(job.totp_secret)
+                    if await _fill_code_or_text(page, totp_code, prefer_code=True):
+                        job.message = f"检测到 2FA 验证页，已自动填入 TOTP ({totp_code})..."
+                        await _submit_form_button(page)
+                        await asyncio.sleep(3.0)
+                        continue
+
+                visible_inputs = page.locator(
+                    'input[type="text"]:visible, input[type="password"]:visible, '
+                    'input[type="email"]:visible, input[type="tel"]:visible, input[inputmode="numeric"]:visible'
+                )
                 if await visible_inputs.count() == 0:
                     await _click_any(
                         page,
                         [
+                            'button:has-text("Trust this device")',
+                            'button:has-text("Continue as")',
                             'button:has-text("I agree")',
                             'button:has-text("Agree")',
                             'button:has-text("Accept")',
@@ -451,13 +735,13 @@ async def _drive_verify(job: MuseJobState, code: str, extra_name: str = ""):
                         timeout=600,
                     )
 
-            # Still not logged in after 24s -> pause cleanly and show live screenshot for next user input
             err_b = await _detect_error_banner(page)
             job.status = "waiting_input"
-            if err_b:
-                job.message = f"页面提示：{err_b}。请根据右侧最新截图继续输入或重试。"
-            else:
-                job.message = "尚未检测到登录完成 Cookie（hatch_sess），请查看右侧最新截图：若页面需要填写姓名/生日/密码/新验证码，可在下方继续提交；若已进入首页可点「立即提取 Cookie」。"
+            job.message = (
+                f"页面提示：{err_b}。请根据右侧最新截图继续输入或重试。"
+                if err_b
+                else "尚未检测到核心 Cookie（hatch_sess），请查看右侧画面继续提交或点「立即提取 Cookie」。"
+            )
         except Exception as exc:
             job.status = "error"
             job.error = f"提交验证异常: {exc}"
@@ -467,8 +751,23 @@ async def _drive_verify(job: MuseJobState, code: str, extra_name: str = ""):
 
 class MuseStartReq(BaseModel):
     email: str
+    password: Optional[str] = ""
+    totp_secret: Optional[str] = ""
     label: Optional[str] = ""
     proxy: Optional[str] = ""
+    admin_key: str
+
+
+class MuseBatchItem(BaseModel):
+    email: str
+    password: Optional[str] = ""
+    totp_secret: Optional[str] = ""
+    label: Optional[str] = ""
+    proxy: Optional[str] = ""
+
+
+class MuseBatchStartReq(BaseModel):
+    items: List[MuseBatchItem]
     admin_key: str
 
 
@@ -484,13 +783,32 @@ class MuseActionReq(BaseModel):
     admin_key: str
 
 
+class TotpPreviewReq(BaseModel):
+    secret: str
+
+
+@router.post("/muse-autoreg/totp-preview")
+async def muse_totp_preview(req: TotpPreviewReq):
+    try:
+        code = _generate_totp(req.secret)
+        rem = 30 - (int(time.time()) % 30)
+        return {"ok": True, "code": code, "remaining": rem}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @router.post("/muse-autoreg/start")
 async def muse_start(req: MuseStartReq):
     _prune_old_jobs()
     _verify_muse_admin_key(req.admin_key)
     email = (req.email or "").strip()
-    if "@" not in email:
-        raise HTTPException(status_code=400, detail="请输入合法的邮箱地址")
+    if not email:
+        raise HTTPException(status_code=400, detail="请输入账号/邮箱")
+    if req.totp_secret:
+        try:
+            _generate_totp(req.totp_secret)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     if req.proxy:
         try:
             _parse_playwright_proxy(req.proxy)
@@ -499,10 +817,54 @@ async def muse_start(req: MuseStartReq):
 
     job_id = uuid.uuid4().hex[:12]
     label = (req.label or "").strip() or email
-    job = MuseJobState(job_id, email, label, req.proxy or "", req.admin_key)
+    job = MuseJobState(
+        job_id,
+        email,
+        (req.password or "").strip(),
+        req.totp_secret or "",
+        label,
+        req.proxy or "",
+        req.admin_key,
+    )
     muse_jobs[job_id] = job
-    asyncio.create_task(_drive_step1(job))
+    asyncio.create_task(_drive_auto_login(job))
     return _job_dict(job)
+
+
+@router.post("/muse-autoreg/batch-start")
+async def muse_batch_start(req: MuseBatchStartReq):
+    _prune_old_jobs()
+    _verify_muse_admin_key(req.admin_key)
+    if not req.items:
+        raise HTTPException(status_code=400, detail="批量列表为空")
+    if len(req.items) > 30:
+        raise HTTPException(status_code=400, detail="单次批量上号最多支持 30 个账号")
+
+    created = []
+    for item in req.items:
+        email = (item.email or "").strip()
+        if not email:
+            continue
+        if item.totp_secret:
+            _generate_totp(item.totp_secret)
+        if item.proxy:
+            _parse_playwright_proxy(item.proxy)
+        job_id = uuid.uuid4().hex[:12]
+        job = MuseJobState(
+            job_id,
+            email,
+            (item.password or "").strip(),
+            item.totp_secret or "",
+            (item.label or "").strip() or email,
+            item.proxy or "",
+            req.admin_key,
+        )
+        job.status = "queued"
+        job.message = "已加入自动登录队列，等待空闲浏览器槽位..."
+        muse_jobs[job_id] = job
+        asyncio.create_task(_drive_auto_login(job))
+        created.append(_job_dict(job))
+    return {"count": len(created), "jobs": created}
 
 
 @router.post("/muse-autoreg/verify")
@@ -511,7 +873,7 @@ async def muse_verify(req: MuseVerifyReq):
     job = muse_jobs.get(req.job_id)
     if not job:
         raise HTTPException(status_code=404, detail="登录会话不存在或已过期")
-    asyncio.create_task(_drive_verify(job, req.code or "", req.extra_name or ""))
+    asyncio.create_task(_drive_manual_verify(job, req.code or "", req.extra_name or ""))
     return _job_dict(job)
 
 
@@ -564,6 +926,8 @@ def _job_dict(job: MuseJobState) -> Dict[str, Any]:
         "email": job.email,
         "label": job.label,
         "proxy": job.proxy_url,
+        "has_password": bool(job.password),
+        "has_2fa": bool(job.totp_secret),
         "status": job.status,
         "hint": job.hint,
         "message": job.message,
@@ -583,7 +947,9 @@ async def muse_login_page():
         if DEFAULT_EGRESS_PROXY
         else ""
     )
-    html = MUSE_LOGIN_HTML.replace("__EXTRA_PROXY_OPTION__", extra_opt)
+    html = MUSE_LOGIN_HTML.replace("__EXTRA_PROXY_OPTION__", extra_opt).replace(
+        "__DEFAULT_EGRESS_JS__", DEFAULT_EGRESS_PROXY
+    )
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
@@ -592,17 +958,20 @@ MUSE_LOGIN_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Meta Muse 极速上号器 & 号池管理</title>
+<title>Meta Muse 账号密码+2FA 全自动上号器 & 号池管理</title>
 <style>
   :root { --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --primary: #3b82f6; --success: #22c55e; --danger: #ef4444; --warn: #f59e0b; --purple: #8b5cf6; --cyan: #06b6d4; }
   * { box-sizing: border-box; }
   body { margin: 0; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
-  .container { max-width: 1200px; margin: 0 auto; }
+  .container { max-width: 1220px; margin: 0 auto; }
   .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
   .title { font-size: 22px; font-weight: 700; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .badge { font-size: 12px; padding: 4px 10px; border-radius: 999px; background: rgba(6,182,212,0.18); color: #22d3ee; font-weight: 600; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .tab { background: #0b1120; border: 1px solid var(--border); color: var(--muted); padding: 8px 16px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .tab.active { background: rgba(6,182,212,0.16); border-color: var(--cyan); color: #67e8f9; }
   input, select, textarea { background: #0b1120; border: 1px solid var(--border); color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 14px; outline: none; }
   input:focus, select:focus, textarea:focus { border-color: var(--cyan); }
   button, a.btn { background: var(--primary); color: #fff; border: none; padding: 9px 16px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: opacity 0.15s; }
@@ -633,50 +1002,68 @@ MUSE_LOGIN_HTML = """<!DOCTYPE html>
 <div class="container">
   <div class="header">
     <div class="title">
-      🎨 Meta Muse 极速上号器 & 多号池管理
+      🎨 Meta Muse 全自动上号器（账号 + 密码 + 2FA 自动登录）
       <span class="badge" id="poolCount">加载中...</span>
     </div>
     <div class="row">
       <a class="btn secondary" href="/admin" target="_blank">🖥️ 完整运维台 & 媒体库</a>
-      <a class="btn secondary" href="/admin/extension" download>🧩 下载 Chrome 导号插件</a>
+      <a class="btn secondary" href="/admin/extension" download>🧩 Chrome 导号插件</a>
       <input type="password" id="adminKey" placeholder="输入 MUSE2API_KEY" style="width:230px">
       <button onclick="saveKeyAndLoad()">验证 / 刷新</button>
     </div>
   </div>
 
-  <!-- 方式一：服务端 Playwright 邮箱验证码直登上号 -->
+  <!-- 方式一：账号密码 + 2FA 全自动登录（支持单号 & 批量多行排队） -->
   <div class="card" style="border-color:#06b6d4">
-    <h3 style="margin:0 0 6px 0;color:#67e8f9">🤖 方式一：服务端邮箱验证码直登上号（免开代理 / 自动提取 HttpOnly Cookie 入池）</h3>
-    <div class="tip" style="margin-bottom:14px">
-      服务器内置 <b>Playwright 真实渲染引擎（美西/美东双美区出口可选）</b>：输入邮箱点击启动后，服务器自动打开 <code>muse.ai</code> 触发登录验证码并回传实时画面；你只需把收到的 <b>邮箱验证码</b>（或密码/姓名）填进来点击提交，系统自动抓齐 <code>HttpOnly hatch_sess</code> 并直接写入 <code>Meta-Muse-Pool</code> 号池！（若遇人机验证将自动停止并提示。）
+    <div class="tabs">
+      <div class="tab active" id="tabSingle" onclick="switchTab('single')">🔐 单号自动登录（账号 + 密码 + 2FA）</div>
+      <div class="tab" id="tabBatch" onclick="switchTab('batch')">📦 批量排队自动上号（多行粘贴 账号----密码----2FA）</div>
     </div>
 
-    <div class="row" style="background:#0b1120;padding:14px;border-radius:10px;border:1px solid var(--border)">
-      <label style="font-size:13px;color:var(--muted)">邮箱:</label>
-      <input type="text" id="baseEmail" placeholder="输入你的邮箱 (如 name@gmail.com)" style="width:230px" oninput="updatePreview()">
-      <select id="aliasMode" onchange="updatePreview()">
-        <option value="raw" selected>原样使用邮箱</option>
-        <option value="plus">Gmail +号别名 (+m01)</option>
-        <option value="dot">Gmail 点号变体</option>
-      </select>
-      <input type="number" id="aliasIdx" value="1" min="1" style="width:66px" onchange="updatePreview()" title="别名序号">
-      <label style="font-size:13px;color:var(--muted)">出口 IP:</label>
-      <select id="proxySel" onchange="toggleCustomProxy()">
-        <option value="">主节点直连 (默认出口)</option>
-        __EXTRA_PROXY_OPTION__
-        <option value="custom">自定义 SOCKS5/HTTP 代理...</option>
-      </select>
-      <input type="text" id="customProxy" placeholder="socks5://user:pass@ip:port" style="display:none;width:220px">
-      <button class="cyan" onclick="startMuseLogin()" style="margin-left:auto">🚀 启动登录 & 发送验证码</button>
+    <!-- 单号模式 -->
+    <div id="paneSingle">
+      <div class="tip" style="margin-bottom:12px">
+        填入 <b>账号/邮箱 + 密码 + 2FA 密钥（Base32 或 <code>otpauth://</code>）</b> 后点启动，服务器自动完成填邮箱 → 填密码 → 实时计算 6 位 TOTP 2FA 验证码 → 自动信任设备 → 提取 <code>HttpOnly hatch_sess</code> 写入号池！若不填密码/2FA，则自动退回邮箱验证码交互模式。
+      </div>
+      <div class="row" style="background:#0b1120;padding:14px;border-radius:10px;border:1px solid var(--border)">
+        <input type="text" id="singleEmail" placeholder="账号 / 邮箱 (必填)" style="width:220px">
+        <input type="password" id="singlePwd" placeholder="密码 (选填，自动填密)" style="width:180px">
+        <input type="text" id="singleTotp" placeholder="2FA Base32 密钥 (选填，自动算码)" style="width:240px" oninput="previewTotp()">
+        <input type="text" id="singleLabel" placeholder="备注标签 (选填)" style="width:140px">
+        <select id="proxySel" onchange="toggleCustomProxy()">
+          <option value="">主节点直连 (默认出口)</option>
+          __EXTRA_PROXY_OPTION__
+          <option value="custom">自定义代理...</option>
+        </select>
+        <input type="text" id="customProxy" placeholder="socks5://user:pass@ip:port" style="display:none;width:200px">
+        <button class="cyan" onclick="startSingleLogin()" style="margin-left:auto">🚀 一键自动登录入池</button>
+      </div>
+      <div id="totpLive" style="margin-top:8px;font-size:13px;color:#4ade80;font-family:monospace"></div>
     </div>
-    <div style="margin-top:8px;font-size:13px;color:#38bdf8;font-family:monospace" id="previewEmail"></div>
+
+    <!-- 批量模式 -->
+    <div id="paneBatch" style="display:none">
+      <div class="tip" style="margin-bottom:10px">
+        每行一个账号，支持 <code>----</code>、<code>|</code>、<code>,</code>、<code>Tab</code> 或空格分隔，格式：<code>账号----密码----2FA密钥</code>（也支持第 4 列填自定义备注标签）。系统按 2 并发排队自动跑完并逐个写入号池！
+      </div>
+      <textarea id="batchLines" rows="5" style="width:100%;font-family:monospace;font-size:13px" placeholder="example1@gmail.com----MyPassword123----JBSWY3DPEHPK3PXP&#10;example2@gmail.com----MyPassword456----NB2W45DFOIZA====----muse02"></textarea>
+      <div class="row" style="margin-top:10px">
+        <label style="font-size:13px;color:var(--muted)">批量出口分配:</label>
+        <select id="batchProxyMode">
+          <option value="direct">全部走主节点直连</option>
+          <option value="egress">全部走独立出口代理</option>
+          <option value="alternate">自动交替分配（美西直连 / 美东出口轮流分流）</option>
+        </select>
+        <button class="cyan" onclick="startBatchLogin()" style="margin-left:auto">🚀 启动批量排队自动上号</button>
+      </div>
+    </div>
 
     <div id="jobList"></div>
   </div>
 
-  <!-- 方式二：快速批量粘贴 Cookie 上号 -->
+  <!-- 方式二：快捷批量粘贴 Cookie -->
   <div class="card">
-    <h3 style="margin:0 0 8px 0">📋 方式二：一键批量粘贴 Cookie 上号（配合 Chrome 扩展或 F12 导出的 Cookie）</h3>
+    <h3 style="margin:0 0 8px 0">📋 方式二：直接粘贴 Cookie 上号（兼容 Network Cookie 头 / EditThisCookie JSON）</h3>
     <div class="row" style="align-items:stretch">
       <input type="text" id="cookieLabel" placeholder="账号标签（可选，如 muse-01）" style="width:220px">
       <input type="text" id="cookieProxy" placeholder="绑定代理（可选，如 socks5://egress-ip:18443）" style="width:320px">
@@ -688,7 +1075,7 @@ MUSE_LOGIN_HTML = """<!DOCTYPE html>
   <!-- 号池监控表格 -->
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
-      <h3 style="margin:0">📦 当前 Meta Muse 多模态号池（文本 <code>muse-spark</code> + 原图 <code>muse-image</code> + 视频 <code>muse-video</code>）</h3>
+      <h3 style="margin:0">📦 当前 Meta Muse 多模态号池（<code>muse-spark</code> + <code>muse-image</code> + <code>muse-video</code>）</h3>
       <div class="row">
         <button class="secondary sm" onclick="keepaliveAll()">💓 一键全池保活 & 唤醒 VM</button>
         <button class="secondary sm" onclick="loadAccounts()">🔄 刷新列表</button>
@@ -714,92 +1101,120 @@ MUSE_LOGIN_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+const DEFAULT_EGRESS = "__DEFAULT_EGRESS_JS__";
 const urlParams = new URLSearchParams(window.location.search);
 if (urlParams.get('key')) {
   localStorage.setItem('muse_admin_key', urlParams.get('key'));
 }
 document.getElementById('adminKey').value = localStorage.getItem('muse_admin_key') || '';
-if (localStorage.getItem('muse_base_email')) {
-  document.getElementById('baseEmail').value = localStorage.getItem('muse_base_email');
-}
-if (localStorage.getItem('muse_alias_idx')) {
-  document.getElementById('aliasIdx').value = localStorage.getItem('muse_alias_idx');
-}
 
-function getKey() {
-  return document.getElementById('adminKey').value.trim();
-}
-function saveKeyAndLoad() {
-  localStorage.setItem('muse_admin_key', getKey());
-  loadAccounts();
+function getKey() { return document.getElementById('adminKey').value.trim(); }
+function saveKeyAndLoad() { localStorage.setItem('muse_admin_key', getKey()); loadAccounts(); }
+function switchTab(t) {
+  document.getElementById('tabSingle').classList.toggle('active', t === 'single');
+  document.getElementById('tabBatch').classList.toggle('active', t === 'batch');
+  document.getElementById('paneSingle').style.display = t === 'single' ? 'block' : 'none';
+  document.getElementById('paneBatch').style.display = t === 'batch' ? 'block' : 'none';
 }
 function toggleCustomProxy() {
-  const v = document.getElementById('proxySel').value;
-  document.getElementById('customProxy').style.display = v === 'custom' ? 'inline-block' : 'none';
+  document.getElementById('customProxy').style.display = document.getElementById('proxySel').value === 'custom' ? 'inline-block' : 'none';
 }
 function getSelectedProxy() {
   const v = document.getElementById('proxySel').value;
   return v === 'custom' ? document.getElementById('customProxy').value.trim() : v;
 }
-function buildEmail(base, mode, idx) {
-  base = (base || '').trim();
-  if (!base.includes('@') || mode === 'raw') return base;
-  const [rawLocal, domain] = base.split('@');
-  const local = rawLocal.split('+')[0];
-  if (mode === 'dot' && local.length > 2) {
-    const clean = local.replace(/\\./g, '');
-    let out = '';
-    for (let i = 0; i < clean.length; i++) {
-      out += clean[i];
-      if (i < clean.length - 1 && ((idx >> i) & 1)) out += '.';
-    }
-    if (out === clean) out = clean[0] + '.' + clean.slice(1);
-    return out + '@' + domain;
-  }
-  return local + '+m' + String(idx).padStart(2, '0') + '@' + domain;
-}
-function updatePreview() {
-  const base = document.getElementById('baseEmail').value.trim();
-  const mode = document.getElementById('aliasMode').value;
-  const idx = parseInt(document.getElementById('aliasIdx').value || '1', 10);
-  const em = buildEmail(base, mode, idx);
-  document.getElementById('previewEmail').textContent = em ? ('本次登录邮箱预览：' + em) : '';
+
+let totpTimer = null;
+async function previewTotp() {
+  clearTimeout(totpTimer);
+  const el = document.getElementById('totpLive');
+  const sec = document.getElementById('singleTotp').value.trim();
+  if (!sec) { el.textContent = ''; return; }
+  totpTimer = setTimeout(async () => {
+    try {
+      const r = await fetch('/muse-autoreg/totp-preview', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secret: sec })
+      });
+      const d = await r.json();
+      if (r.ok) {
+        el.style.color = '#4ade80';
+        el.textContent = `✅ 2FA 密钥有效 · 当前实时动态码：${d.code}（剩余 ${d.remaining}s）`;
+      } else {
+        el.style.color = '#f87171';
+        el.textContent = '⚠️ ' + (d.detail || '2FA 密钥格式无效');
+      }
+    } catch (e) {}
+  }, 250);
 }
 
 const activeJobs = {};
 
-async function startMuseLogin() {
+async function startSingleLogin() {
   const key = getKey();
   if (!key) return alert('请先在右上角填入 MUSE2API_KEY');
-  const base = document.getElementById('baseEmail').value.trim();
-  if (!base || !base.includes('@')) return alert('请输入合法邮箱');
-  const mode = document.getElementById('aliasMode').value;
-  const idx = parseInt(document.getElementById('aliasIdx').value || '1', 10);
-  const email = buildEmail(base, mode, idx);
+  const email = document.getElementById('singleEmail').value.trim();
+  if (!email) return alert('请输入账号或邮箱');
+  const password = document.getElementById('singlePwd').value;
+  const totp_secret = document.getElementById('singleTotp').value.trim();
+  const label = document.getElementById('singleLabel').value.trim() || email;
   const proxy = getSelectedProxy();
-
   localStorage.setItem('muse_admin_key', key);
-  localStorage.setItem('muse_base_email', base);
-  if (mode !== 'raw') {
-    document.getElementById('aliasIdx').value = String(idx + 1);
-    localStorage.setItem('muse_alias_idx', String(idx + 1));
-    updatePreview();
-  }
 
-  try {
-    const r = await fetch('/muse-autoreg/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, label: email, proxy, admin_key: key })
-    });
-    const d = await r.json();
-    if (!r.ok) return alert(d.detail || '启动失败');
-    activeJobs[d.job_id] = d;
-    renderJobs();
-    pollJob(d.job_id);
-  } catch (e) {
-    alert('请求异常: ' + e);
-  }
+  const r = await fetch('/muse-autoreg/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password, totp_secret, label, proxy, admin_key: key })
+  });
+  const d = await r.json();
+  if (!r.ok) return alert(d.detail || '启动失败');
+  activeJobs[d.job_id] = d;
+  renderJobs();
+  pollJob(d.job_id);
+}
+
+function parseAccountLine(line) {
+  const s = line.trim();
+  if (!s || s.startsWith('#')) return null;
+  let parts;
+  if (s.includes('----')) parts = s.split('----');
+  else if (s.includes('|')) parts = s.split('|');
+  else if (s.includes('\t')) parts = s.split('\t');
+  else if (s.includes(',')) parts = s.split(',');
+  else parts = s.split(/\\s+/);
+  parts = parts.map(x => x.trim()).filter((_, idx) => idx < 4);
+  if (!parts[0]) return null;
+  return {
+    email: parts[0],
+    password: parts[1] || '',
+    totp_secret: parts[2] || '',
+    label: parts[3] || parts[0],
+  };
+}
+
+async function startBatchLogin() {
+  const key = getKey();
+  if (!key) return alert('请先在右上角填入 MUSE2API_KEY');
+  const raw = document.getElementById('batchLines').value;
+  const mode = document.getElementById('batchProxyMode').value;
+  const parsed = raw.split(/\\r?\\n/).map(parseAccountLine).filter(Boolean);
+  if (!parsed.length) return alert('未解析到有效账号行，请按「账号----密码----2FA」格式每行粘贴一个');
+  parsed.forEach((item, i) => {
+    if (mode === 'egress' && DEFAULT_EGRESS) item.proxy = DEFAULT_EGRESS;
+    else if (mode === 'alternate' && DEFAULT_EGRESS && i % 2 === 1) item.proxy = DEFAULT_EGRESS;
+    else item.proxy = '';
+  });
+
+  const r = await fetch('/muse-autoreg/batch-start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: parsed, admin_key: key })
+  });
+  const d = await r.json();
+  if (!r.ok) return alert(d.detail || '批量启动失败');
+  (d.jobs || []).forEach(j => {
+    activeJobs[j.job_id] = j;
+    pollJob(j.job_id);
+  });
+  renderJobs();
 }
 
 async function pollJob(jobId) {
@@ -809,12 +1224,12 @@ async function pollJob(jobId) {
       const r = await fetch('/muse-autoreg/status/' + jobId);
       if (!r.ok) { clearInterval(timer); return; }
       const d = await r.json();
-      const prevStatus = activeJobs[jobId].status;
+      const prev = activeJobs[jobId].status;
       activeJobs[jobId] = d;
       renderJobs();
       if (d.status === 'done') {
         clearInterval(timer);
-        if (prevStatus !== 'done') loadAccounts();
+        if (prev !== 'done') loadAccounts();
       } else if (d.status === 'error' || d.status === 'blocked') {
         clearInterval(timer);
       }
@@ -823,15 +1238,11 @@ async function pollJob(jobId) {
 }
 
 async function submitVerify(jobId) {
-  const key = getKey();
-  const codeEl = document.getElementById('code_' + jobId);
-  const nameEl = document.getElementById('name_' + jobId);
-  const code = codeEl ? codeEl.value.trim() : '';
-  const extra_name = nameEl ? nameEl.value.trim() : '';
+  const code = (document.getElementById('code_' + jobId) || {}).value || '';
+  const extra_name = (document.getElementById('name_' + jobId) || {}).value || '';
   const r = await fetch('/muse-autoreg/verify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ job_id: jobId, code, extra_name, admin_key: key })
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ job_id: jobId, code: code.trim(), extra_name: extra_name.trim(), admin_key: getKey() })
   });
   const d = await r.json();
   if (!r.ok) return alert(d.detail || '提交失败');
@@ -842,8 +1253,7 @@ async function submitVerify(jobId) {
 
 async function extractNow(jobId) {
   const r = await fetch('/muse-autoreg/extract', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ job_id: jobId, admin_key: getKey() })
   });
   const d = await r.json();
@@ -855,14 +1265,10 @@ async function extractNow(jobId) {
 
 async function refreshSnap(jobId) {
   const r = await fetch('/muse-autoreg/snap', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ job_id: jobId, admin_key: getKey() })
   });
-  if (r.ok) {
-    activeJobs[jobId] = await r.json();
-    renderJobs();
-  }
+  if (r.ok) { activeJobs[jobId] = await r.json(); renderJobs(); }
 }
 
 async function closeJob(jobId) {
@@ -880,25 +1286,26 @@ function renderJobs() {
     const showInput = ['waiting_code', 'waiting_input'].includes(j.status);
     const oldCode = (document.getElementById('code_' + j.job_id) || {}).value || '';
     const oldName = (document.getElementById('name_' + j.job_id) || {}).value || '';
+    const badges = `${j.has_password ? '🔑密码 ' : ''}${j.has_2fa ? '🛡️2FA ' : ''}${j.proxy || '主节点直连'}`;
     return `
       <div class="${cls}">
         <div class="auto-grid">
           <div>
             <div class="row" style="justify-content:space-between;margin-bottom:8px">
-              <strong>📧 ${j.email} <span style="font-size:12px;color:var(--muted)">(${j.proxy || '美西直连'})</span></strong>
+              <strong>📧 ${j.email} <span style="font-size:12px;color:var(--muted)">(${badges})</span></strong>
               <span class="status-pill ${j.status==='done'?'status-ok':(j.status==='error'||j.status==='blocked'?'status-bad':'status-warn')}">${j.status}</span>
             </div>
             <div class="tip" style="color:${j.error?'#fca5a5':'#cbd5e1'};margin-bottom:10px">${j.message}</div>
             ${showInput ? `
               <div class="row" style="margin-bottom:8px">
-                <input type="text" id="code_${j.job_id}" value="${oldCode.replace(/"/g,'&quot;')}" placeholder="${j.hint==='password'?'输入账号密码':'输入邮箱收到的验证码（或页面要求字段）'}" style="width:260px">
-                <input type="text" id="name_${j.job_id}" value="${oldName.replace(/"/g,'&quot;')}" placeholder="可选：新号昵称" style="width:150px">
-                <button class="success" onclick="submitVerify('${j.job_id}')">✅ 提交并自动入池</button>
+                <input type="text" id="code_${j.job_id}" value="${oldCode.replace(/"/g,'&quot;')}" placeholder="${j.hint==='password'?'输入账号密码':'输入验证码 / 页面要求字段'}" style="width:260px">
+                <input type="text" id="name_${j.job_id}" value="${oldName.replace(/"/g,'&quot;')}" placeholder="可选：昵称" style="width:140px">
+                <button class="success" onclick="submitVerify('${j.job_id}')">✅ 提交并继续</button>
               </div>
             ` : ''}
             <div class="row">
               ${j.status !== 'done' ? `<button class="secondary sm" onclick="refreshSnap('${j.job_id}')">🔄 刷新画面</button>` : ''}
-              ${j.status !== 'done' ? `<button class="purple sm" onclick="extractNow('${j.job_id}')">🍪 立即提取 Cookie 入池</button>` : ''}
+              ${j.status !== 'done' ? `<button class="purple sm" onclick="extractNow('${j.job_id}')">🍪 立即提取 Cookie</button>` : ''}
               <button class="danger" onclick="closeJob('${j.job_id}')">关闭会话</button>
             </div>
           </div>
@@ -927,16 +1334,11 @@ async function importCookieHeader() {
         const c = {}, e = {};
         parsed.forEach(item => { if (item.name) { c[item.name] = item.value; if (item.expirationDate) e[item.name] = Math.floor(item.expirationDate); } });
         body.cookies = c; body.expires = e;
-      } else {
-        body.cookies = parsed;
-      }
+      } else { body.cookies = parsed; }
     } catch { body.cookie_header = txt; }
-  } else {
-    body.cookie_header = txt;
-  }
+  } else { body.cookie_header = txt; }
   const r = await fetch('/admin/accounts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
     body: JSON.stringify(body)
   });
   const d = await r.json();
@@ -960,13 +1362,13 @@ async function loadAccounts() {
     const st = d.stats || {};
     document.getElementById('poolCount').textContent = `总号数: ${list.length} | 健康: ${st.healthy || 0}`;
     if (!list.length) {
-      document.getElementById('accountTable').innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted)">号池暂无账号，请用上方上号器登录或用 Chrome 扩展一键导入</td></tr>';
+      document.getElementById('accountTable').innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted)">号池暂无账号</td></tr>';
       return;
     }
     document.getElementById('accountTable').innerHTML = list.map(a => {
       const okBadge = a.ok === true ? '<span class="status-pill status-ok">可用</span>' : (a.ok === false ? '<span class="status-pill status-bad">异常</span>' : '<span class="status-pill status-warn">未检测</span>');
       const exp = a.expires_at ? new Date(a.expires_at * 1000).toLocaleString() : '未知';
-      const proxyStr = (a.proxy && a.proxy.server) ? a.proxy.server : '美西直连';
+      const proxyStr = (a.proxy && a.proxy.server) ? a.proxy.server : '主节点直连';
       const q = a.quota ? `${a.quota.plan || ''} (${a.quota.remaining_pct ?? a.quota.used_pct ?? '?'}%)` : '未查';
       return `
         <tr>
@@ -1011,7 +1413,6 @@ async function keepaliveAll() {
   loadAccounts();
 }
 
-updatePreview();
 if (getKey()) loadAccounts();
 </script>
 </body>
