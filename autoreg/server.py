@@ -189,7 +189,9 @@ async def start_register(req: StartRequest):
     job_id = uuid.uuid4().hex[:12]
     name = (req.name or "").strip() or random_name()
     password = (req.password or "").strip() or random_password()
-    proxy = (req.proxy or "").strip()
+    raw_proxy = (req.proxy or "").strip()
+    proxy_pool = [p.strip() for p in raw_proxy.replace("\n", ",").replace(";", ",").split(",") if p.strip()]
+    proxy = random.choice(proxy_pool) if proxy_pool else "" 
 
     job = JobState(job_id, email, name, password, req.admin_key, proxy=proxy)
     job.session_id = sess_data["id"]
@@ -202,6 +204,7 @@ async def start_register(req: StartRequest):
         "email": email,
         "name": name,
         "password": password,
+        "proxy": proxy,
         "status": job.status,
         "message": job.message,
     }
@@ -288,7 +291,8 @@ async def drive_step1_send_code(job: JobState):
             page.on("response", log_sso_resp)
 
             job.status = "sending_code"
-            job.message = f"正在打开 AWS Quick 登录页并填入邮箱 {job.email}..."
+            proxy_note = f" (随机分配出口: {job.proxy})" if job.proxy else " (直连服务器出口)"
+            job.message = f"正在打开 AWS Quick 登录页并填入邮箱 {job.email}{proxy_note}..."
             await page.goto(job.discovery_url, wait_until="domcontentloaded", timeout=35000)
 
             try:
@@ -623,6 +627,7 @@ async def get_job_status(job_id: str):
         "email": job.email,
         "name": job.name,
         "password": job.password,
+        "proxy": job.proxy,
         "status": job.status,
         "message": job.message,
         "error": job.error,

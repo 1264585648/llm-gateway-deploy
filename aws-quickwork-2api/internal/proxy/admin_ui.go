@@ -271,14 +271,15 @@ const adminHTMLPage = `<!DOCTYPE html>
       <input type="text" id="baseEmail" placeholder="例如 rahafsunm7md7@gmail.com" style="width:220px" value="rahafsunm7md7@gmail.com">
       <label style="font-size:13px;color:var(--muted)">别名规则:</label>
       <select id="aliasMode" onchange="updatePreviewAlias()">
-        <option value="dot" selected>点号变体 (u.ser@gmail.com 推荐)</option>
+        <option value="dot_rand" selected>随机点号变体 (每次随机分配新地址)</option>
+        <option value="dot">顺序点号变体 (按序号)</option>
         <option value="plus">+号后缀 (user+q01@gmail.com)</option>
         <option value="raw">原样使用输入框邮箱</option>
       </select>
       <label style="font-size:13px;color:var(--muted)">序号:</label>
       <input type="number" id="aliasStartIdx" value="1" min="1" style="width:64px" onchange="updatePreviewAlias()">
-      <label style="font-size:13px;color:var(--muted)">住宅代理(可选):</label>
-      <input type="text" id="proxyUrl" placeholder="http://user:pass@ip:port 或留空" style="width:210px">
+      <label style="font-size:13px;color:var(--muted)">代理池(逗号分隔,每次随机挑1个):</label>
+      <input type="text" id="proxyUrl" placeholder="如 http://172.18.0.1:17890, http://135.148.234.185:18443" style="width:270px">
       <span style="font-size:13px;color:#a78bfa;font-family:monospace" id="previewAlias"></span>
       <button class="purple" onclick="startAutoReg()" style="margin-left:auto">🚀 一键裂变别名 & 发送验证码</button>
     </div>
@@ -347,12 +348,15 @@ function generateAlias(baseEmail, mode, index) {
   const parts = baseEmail.split('@');
   const local = parts[0].split('+')[0];
   const domain = parts[1];
-  if (mode === 'dot' && local.length > 2) {
+  if ((mode === 'dot' || mode === 'dot_rand') && local.length > 2) {
     const clean = local.replace(/\./g, '');
+    const mask = mode === 'dot_rand'
+      ? Math.max(1, Math.floor(Math.random() * ((1 << Math.min(clean.length - 1, 16)) - 1)) + 1)
+      : index;
     let out = '';
     for (let i = 0; i < clean.length; i++) {
       out += clean[i];
-      if (i < clean.length - 1 && ((index >> i) & 1)) {
+      if (i < clean.length - 1 && ((mask >> i) & 1)) {
         out += '.';
       }
     }
@@ -469,6 +473,7 @@ function renderJobCard(j) {
       '<div class="row" style="margin-bottom:6px">' +
         '<span class="badge" style="background:rgba(139,92,246,0.2);color:#c4b5fd">📧 ' + j.email + '</span>' +
         '<span style="font-size:12px;color:var(--muted);font-family:monospace">自动密码: ' + j.password + '</span>' +
+        (j.proxy ? '<span class="badge" style="background:rgba(34,197,94,0.16);color:#4ade80">🌐 出口: ' + j.proxy + '</span>' : '') +
       '</div>' +
       '<div id="jobmsg-' + j.job_id + '" style="font-weight:600;color:' + statusColor + ';font-size:14px">' + j.message + '</div>' +
       actionArea +

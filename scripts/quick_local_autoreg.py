@@ -35,12 +35,13 @@ def generate_alias(base_email: str, mode: str, idx: int) -> str:
     base_email = base_email.strip()
     local, domain = base_email.split("@", 1)
     local = local.split("+")[0]
-    if mode == "dot" and len(local) > 2:
+    if mode in ("dot", "dot_rand") and len(local) > 2:
         clean = local.replace(".", "")
+        mask = random.randint(1, (1 << min(len(clean) - 1, 16)) - 1) if mode == "dot_rand" else idx
         out = []
         for i, ch in enumerate(clean):
             out.append(ch)
-            if i < len(clean) - 1 and ((idx >> i) & 1):
+            if i < len(clean) - 1 and ((mask >> i) & 1):
                 out.append(".")
         res = "".join(out)
         if res == clean:
@@ -305,16 +306,25 @@ def main():
     print("=== AWS Quick 本机干净 IP 别名上号器 ===")
     admin_key = ADMIN_KEY or input("请输入管理口令 (Admin Key): ").strip()
     base_email = input("请输入基础 Gmail 邮箱 (例如 rahafsunm7md7@gmail.com): ").strip()
-    mode = (input("别名模式 [dot(点号变体,默认) / plus(+号后缀) / raw(原样)]: ").strip() or "dot").lower()
+    mode = (input("别名模式 [dot_rand(随机点号,默认) / dot(顺序点号) / plus(+号后缀) / raw]: ").strip() or "dot_rand").lower()
     start_idx = int(input("起始序号 (默认 1): ").strip() or "1")
     count = int(input("连续注册数量 (默认 3): ").strip() or "3")
-    proxy_url = input("本机代理 (直接回车使用系统当前网络，或填 http://127.0.0.1:7890): ").strip()
+    raw_proxy = input("代理池(支持逗号分隔多个,每次随机挑1个; 默认本机 Clash http://127.0.0.1:7890, 填 none 则不用代理): ").strip()
+    if raw_proxy.lower() == "none":
+        proxy_pool = []
+    elif raw_proxy == "":
+        proxy_pool = ["http://127.0.0.1:7890"]
+    else:
+        proxy_pool = [p.strip() for p in raw_proxy.replace(";", ",").split(",") if p.strip()]
 
     with sync_playwright() as p:
         for i in range(count):
             idx = start_idx + i
             email = generate_alias(base_email, mode, idx)
-            ok = register_one(p, admin_key, email, proxy_url=proxy_url)
+            chosen_proxy = random.choice(proxy_pool) if proxy_pool else ""
+            if chosen_proxy:
+                print(f"🌐 本轮随机分配代理: {chosen_proxy}")
+            ok = register_one(p, admin_key, email, proxy_url=chosen_proxy)
             if not ok:
                 cont = input("本轮未完成，是否继续下一个？(y/N): ").strip().lower()
                 if cont != "y":
