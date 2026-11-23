@@ -208,26 +208,36 @@ async def _detect_error_banner(page: Page) -> Optional[str]:
     return None
 
 
-async def _click_any(page: Page, selectors, timeout=2500) -> bool:
+async def _click_any(page: Page, selectors, timeout=1500) -> bool:
     for sel in selectors:
         try:
-            loc = page.locator(sel).first
-            if await loc.is_visible(timeout=timeout):
-                await loc.click()
-                return True
+            locs = page.locator(sel)
+            cnt = await locs.count()
+            if cnt == 0:
+                continue
+            for i in range(min(cnt, 4)):
+                loc = locs.nth(i)
+                if await loc.is_visible(timeout=min(timeout, 400)):
+                    await loc.click()
+                    return True
         except Exception:
             continue
     return False
 
 
-async def _fill_any(page: Page, selectors, text: str, timeout=4000) -> bool:
+async def _fill_any(page: Page, selectors, text: str, timeout=3000) -> bool:
     for sel in selectors:
         try:
-            loc = page.locator(sel).first
-            if await loc.is_visible(timeout=timeout):
-                await loc.click()
-                await loc.fill(text)
-                return True
+            locs = page.locator(sel)
+            cnt = await locs.count()
+            if cnt == 0:
+                continue
+            for i in range(min(cnt, 4)):
+                loc = locs.nth(i)
+                if await loc.is_visible(timeout=min(timeout, 600)):
+                    await loc.click()
+                    await loc.fill(text)
+                    return True
         except Exception:
             continue
     return False
@@ -336,18 +346,30 @@ async def _submit_form_button(page: Page) -> bool:
         [
             'button[type="submit"]',
             'input[type="submit"]',
-            'button:has-text("Log in")',
-            'button:has-text("Log In")',
-            'button:has-text("Continue")',
-            'button:has-text("Verify")',
-            'button:has-text("Submit")',
             'button:has-text("Next")',
+            '[role="button"]:has-text("Next")',
+            'button:has-text("Log in")',
+            '[role="button"]:has-text("Log in")',
+            'button:has-text("Log In")',
+            '[role="button"]:has-text("Log In")',
+            'button:has-text("Continue")',
+            '[role="button"]:has-text("Continue")',
+            'button:has-text("Verify")',
+            '[role="button"]:has-text("Verify")',
+            'button:has-text("Submit")',
+            '[role="button"]:has-text("Submit")',
             'button:has-text("Confirm")',
+            '[role="button"]:has-text("Confirm")',
             'button:has-text("登录")',
+            '[role="button"]:has-text("登录")',
             'button:has-text("继续")',
+            '[role="button"]:has-text("继续")',
+            'button:has-text("下一步")',
+            '[role="button"]:has-text("下一步")',
             'button:has-text("确认")',
+            '[role="button"]:has-text("确认")',
         ],
-        timeout=2500,
+        timeout=1200,
     )
     if not clicked:
         try:
@@ -508,6 +530,30 @@ async def _drive_auto_login(job: MuseJobState):
                             await _snap(job)
                             continue
 
+                    # Case C0: Meta "Confirm your Meta Account" -> select Third-party Authentication App -> click Next
+                    is_meta_method_select = (
+                        "confirm your meta account" in body
+                        or "please select a method" in body
+                        or ("third-party authentication app" in body and "recovery code" in body)
+                    )
+                    if is_meta_method_select:
+                        job.message = "检测到「Confirm your Meta Account」验证方式选择页，自动选择 Authentication App 并点击 Next..."
+                        await _click_any(
+                            page,
+                            [
+                                'label:has-text("Third-party Authentication App")',
+                                'div[role="radio"]:has-text("Authentication App")',
+                                'span:has-text("Third-party Authentication App")',
+                                'span:has-text("Authentication App")',
+                            ],
+                            timeout=1200,
+                        )
+                        await asyncio.sleep(0.4)
+                        await _submit_form_button(page)
+                        await asyncio.sleep(3.5)
+                        await _snap(job)
+                        continue
+
                     # Case C: Meta 2FA defaulted to "Check your notifications on another device" -> switch to Authenticator App
                     is_other_device_2fa = (
                         job.totp_secret
@@ -606,7 +652,7 @@ async def _drive_auto_login(job: MuseJobState):
                             await _snap(job)
                             return
 
-                    # Case E: Post-2FA "Trust this device" / "Save browser" / "Continue as ..." / "I agree"
+                    # Case E: Post-2FA "Trust this device" / "Save browser" / "Continue as ..." / "Next" / "I agree"
                     visible_inputs = page.locator(
                         'input[type="text"]:visible, input[type="password"]:visible, '
                         'input[type="email"]:visible, input[type="tel"]:visible, input[inputmode="numeric"]:visible'
@@ -616,19 +662,37 @@ async def _drive_auto_login(job: MuseJobState):
                             page,
                             [
                                 'button:has-text("Trust this device")',
+                                '[role="button"]:has-text("Trust this device")',
                                 'button:has-text("Always confirm")',
+                                '[role="button"]:has-text("Always confirm")',
                                 'button:has-text("Save browser")',
+                                '[role="button"]:has-text("Save browser")',
+                                'button:has-text("Remember browser")',
+                                '[role="button"]:has-text("Remember browser")',
                                 'button:has-text("Continue as")',
+                                '[role="button"]:has-text("Continue as")',
+                                'button:has-text("Next")',
+                                '[role="button"]:has-text("Next")',
                                 'button:has-text("Continue")',
+                                '[role="button"]:has-text("Continue")',
                                 'button:has-text("I agree")',
+                                '[role="button"]:has-text("I agree")',
                                 'button:has-text("Agree")',
+                                '[role="button"]:has-text("Agree")',
                                 'button:has-text("Accept")',
+                                '[role="button"]:has-text("Accept")',
                                 'button:has-text("Get started")',
+                                '[role="button"]:has-text("Get started")',
                                 'button:has-text("Skip")',
+                                '[role="button"]:has-text("Skip")',
                                 'button:has-text("信任此设备")',
+                                '[role="button"]:has-text("信任此设备")',
                                 'button:has-text("继续")',
+                                '[role="button"]:has-text("继续")',
+                                'button:has-text("下一步")',
+                                '[role="button"]:has-text("下一步")',
                             ],
-                            timeout=700,
+                            timeout=500,
                         )
                         if clicked_post:
                             job.message = "正在确认设备信任与工作区授权跳转..."
