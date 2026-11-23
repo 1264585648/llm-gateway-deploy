@@ -37,11 +37,15 @@ def generate_alias(base_email: str, mode: str, idx: int) -> str:
     local = local.split("+")[0]
     if mode in ("dot", "dot_rand") and len(local) > 2:
         clean = local.replace(".", "")
-        mask = random.randint(1, (1 << min(len(clean) - 1, 16)) - 1) if mode == "dot_rand" else idx
+        max_pos = len(clean) - 1
+        if mode == "dot_rand":
+            dot_count = 1 if random.random() < 0.5 else min(2, max_pos)
+            chosen = set(random.sample(range(max_pos), dot_count))
+            return "".join(ch + ("." if i in chosen else "") for i, ch in enumerate(clean)) + f"@{domain}"
         out = []
         for i, ch in enumerate(clean):
             out.append(ch)
-            if i < len(clean) - 1 and ((mask >> i) & 1):
+            if i < max_pos and ((idx >> i) & 1):
                 out.append(".")
         res = "".join(out)
         if res == clean:
@@ -115,6 +119,7 @@ def register_one(playwright, admin_key: str, email: str, proxy_url: str = "") ->
 
     launch_kwargs = {
         "headless": False,
+        "ignore_default_args": ["--enable-automation"],
         "args": ["--disable-blink-features=AutomationControlled"],
     }
     # 优先使用本机 Chrome，不存在则回退 Edge 或 Playwright 内置 Chromium
@@ -309,11 +314,9 @@ def main():
     mode = (input("别名模式 [dot_rand(随机点号,默认) / dot(顺序点号) / plus(+号后缀) / raw]: ").strip() or "dot_rand").lower()
     start_idx = int(input("起始序号 (默认 1): ").strip() or "1")
     count = int(input("连续注册数量 (默认 3): ").strip() or "3")
-    raw_proxy = input("代理池(支持逗号分隔多个,每次随机挑1个; 默认本机 Clash http://127.0.0.1:7890, 填 none 则不用代理): ").strip()
-    if raw_proxy.lower() == "none":
+    raw_proxy = input("代理池(支持逗号分隔多个; 直接回车走本机直连网络[推荐,实测过TES], 或填 http://127.0.0.1:7890): ").strip()
+    if raw_proxy == "" or raw_proxy.lower() == "none":
         proxy_pool = []
-    elif raw_proxy == "":
-        proxy_pool = ["http://127.0.0.1:7890"]
     else:
         proxy_pool = [p.strip() for p in raw_proxy.replace(";", ",").split(",") if p.strip()]
 

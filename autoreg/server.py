@@ -82,6 +82,7 @@ async def get_browser() -> Browser:
         use_headed = bool(os.environ.get("DISPLAY"))
         browser_instance = await playwright_instance.chromium.launch(
             headless=not use_headed,
+            ignore_default_args=["--enable-automation"],
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
@@ -344,8 +345,15 @@ async def drive_step1_send_code(job: JobState):
             )
 
             job.message = "已提交邮箱，正在等待跳转至姓名/验证码页面..."
-            await asyncio.sleep(4.0)
-            await snap(job)
+            for _ in range(12):
+                await asyncio.sleep(2.0)
+                await snap(job)
+                try:
+                    btxt = (await page.inner_text("body")).lower()
+                except Exception:
+                    btxt = ""
+                if "enter your name" in btxt or "verification code" in btxt or "verify your email" in btxt or "password" in btxt:
+                    break
 
             if err_msg := await detect_block_or_error(page):
                 job.status = "error"
@@ -353,7 +361,7 @@ async def drive_step1_send_code(job: JobState):
                 job.message = err_msg
                 return
 
-            for step_try in range(4):
+            for step_try in range(8):
                 await human_click(page, ["button#awsccc-cb-btn-accept", "button:has-text('Accept')"], timeout=800)
 
                 body_text = (await page.inner_text("body")).lower()
